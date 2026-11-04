@@ -1,0 +1,129 @@
+"""Pydantic schemas for Phase 3 mock execution.
+
+Final workflow statuses
+-----------------------
+COMPLETED              every step succeeded and was verified.
+FAILED                 a step failed and no side effects had been made (nothing to undo).
+ROLLED_BACK            a step failed; every completed side effect was compensated.
+PARTIALLY_ROLLED_BACK  a step failed; every reversible effect was compensated, but at least
+                       one non-reversible effect (e.g. a Teams message) remains.
+COMPENSATION_FAILED    a step failed and at least one compensation also failed, so one or
+                       more effects remain that should have been undone. Needs manual review.
+REJECTED               the request was refused before execution (no approval, invalid plan).
+"""
+
+from enum import Enum
+from typing import Any, Literal
+from uuid import UUID
+
+from pydantic import BaseModel, ConfigDict, Field
+
+from app.schemas.plan import ValidationResult
+
+
+class ExecutionStatus(str, Enum):
+    COMPLETED = "COMPLETED"
+    FAILED = "FAILED"
+    ROLLED_BACK = "ROLLED_BACK"
+    PARTIALLY_ROLLED_BACK = "PARTIALLY_ROLLED_BACK"
+    COMPENSATION_FAILED = "COMPENSATION_FAILED"
+    REJECTED = "REJECTED"
+
+
+class StepStatus(str, Enum):
+    SUCCEEDED = "SUCCEEDED"
+    FAILED = "FAILED"
+    SKIPPED = "SKIPPED"  # not run because an earlier step failed
+
+
+class CompensationStatus(str, Enum):
+    COMPENSATED = "COMPENSATED"
+    ALREADY_COMPENSATED = "ALREADY_COMPENSATED"  # idempotent repeat: effect was already undone
+    NOT_COMPENSATABLE = "NOT_COMPENSATABLE"  # e.g. Teams message: cannot be unsent
+    FAILED = "FAILED"
+
+
+# ---------- request ----------
+
+
+class ExecutionApproval(BaseModel):
+    """Explicit per-request approval. NOT authentication: approved_by is an unverified label."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    approved: bool = Field(description="Must be true to execute.")
+    mode: Literal["mock"] = Field(description="Only 'mock' execution exists in Phase 3.")
+    approved_by: str = Field(min_length=3, max_length=80, examples=["synthetic.reviewer"])
+
+
+class ExecutionStepIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    step_number: int = Field(ge=1, le=100)
+    integration: str = Field(max_length=40, examples=["notion"])
+    action: str = Field(max_length=40, examples=["create_page"])
+    description: str = Field(default="", max_length=500)
+    arguments: dict[str, str] = Field(default_factory=dict, max_length=10)
+    depends_on: list[int] = Field(default_factory=list, max_length=50)
+
+
+class ExecutionPlanIn(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    summary: str = Field(default="", max_length=1000)
+    steps: list[ExecutionStepIn] = Field(max_length=50)
+
+
+class ExecutionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    workflow_id: UUID = Field(description="Also the request idempotency key.")
+    plan: ExecutionPlanIn
+    approval: ExecutionApproval
+
+
+# ---------- response ----------
+
+
+class ExecutionError(BaseModel):
+    code: str
+    message: str
+    step_number: int | None = None
+    attempt: int | None = None
+    retryable: bool = False
+
+
+class StepResult(BaseModel):
+    step_number: int
+    integration: str
+    action: str
+    status: StepStatus
+    attempts: int
+    resource_id: str | None = None
+    output: dict[str, Any] = Field(default_factory=dict)
+    replayed: bool = Field(default=False, description="Tool returned a stored result for this idempotency key")
+    error: ExecutionError | None = None
+
+
+class CompensationResult(BaseModel):
+    step_number: int
+    integration: str
+    action: str
+    resource_id: str | None
+    status: CompensationStatus
+    attempts: int
+    message: str
+
+
+class ExecutionResponse(BaseModel):
+    workflow_id: UUID
+    status: ExecutionStatus
+    mode: Literal["mock"] = "mock"
+    validation: ValidationResult
+    step_results: list[StepResult]
+    attempts: dict[str, int] = Field(description="Attempts per step_number")
+    retry_delays_seconds: list[float]
+    errors: list[ExecutionError]
+    compensation_results: list[CompensationResult]
+    replayed: bool = Field(default=False, description="True if this is a stored result for a duplicate request")
+    message: str
