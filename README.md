@@ -2,14 +2,16 @@
 
 FDE Capstone: an AI workflow orchestrator that turns unstructured input (meeting notes, backlogs, incident reports) into executed multi-tool workflows.
 
-## Target architecture
+## Architecture
+
+![WorkflowWeaver architecture](docs/architecture.png)
 
 | Layer | Technology |
 |---|---|
-| API | FastAPI (+ SSE for live progress) |
-| Orchestration | LangGraph Python SDK + Claude |
-| Integrations | Notion MCP, Google Drive MCP, Microsoft Teams webhook |
-| Observability | Langfuse |
+| API | FastAPI: REST + Server-Sent Events for live progress |
+| Orchestration | LangGraph: planning graph + execution graph (retries, Saga compensation); Claude or mock planner |
+| Integrations | **Mock** Notion / Google Drive / Teams adapters (Phase 4). Real Notion MCP, Google Drive MCP, Teams webhook: Phase 5 |
+| Observability | Langfuse Python SDK v5 (optional, failure-isolated) |
 | Frontend | React 19 + TypeScript + Vite 8 + Tailwind CSS 4 (`frontend/`) |
 
 ## Status
@@ -19,10 +21,26 @@ FDE Capstone: an AI workflow orchestrator that turns unstructured input (meeting
 | 1 | FastAPI skeleton, templates, `PLANNED` workflow records | Done |
 | 2 | LangGraph planning agent: natural language → validated plan | Done |
 | 3 | LangGraph execution graph over **mock** tools: approval gate, bounded retries, idempotency, Saga compensation | **Done (mock only)** |
-| 4 | Langfuse observability, SSE progress, React + Tailwind UI, integration and reliability testing (Stages 1-4 done); docs next | In progress |
-| 5 | Real Notion / Drive MCP and Teams webhook adapters | Planned |
+| 4 | Langfuse observability, SSE live progress, React + Tailwind UI, mock document validation, integration and reliability testing | **Done (mock only)** |
+| 5 | Real Notion / Drive MCP and Teams webhook adapters, persistence, authentication | Planned |
 
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the design, graph flow, state model, and a worked example.
+[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the implementation in detail: both LangGraph graphs, state, the SSE transport, observability, security boundaries, a real worked example, test inventory, limitations and Phase 5 recommendations.
+
+## Quick start (two terminals, Windows PowerShell)
+
+```powershell
+# Terminal 1 - backend (http://127.0.0.1:8000, docs at /docs)
+cd C:\Projects\workflowweaver\backend
+$env:PLANNER_MODE = "mock"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# Terminal 2 - frontend (http://127.0.0.1:5173)
+cd C:\Projects\workflowweaver\frontend
+npm install
+npm run dev
+```
+
+Open http://127.0.0.1:5173, pick a template, click **Generate Plan**, review it, approve, and watch the live timeline and report. First-time backend setup is described in [Setup](#setup-windows-powershell).
 
 ## Endpoints
 
@@ -88,7 +106,7 @@ Settings come from environment variables, or from `C:\Projects\workflowweaver\.e
 | `PLANNER_TIMEOUT_SECONDS` | `60` | Per-request timeout for Claude |
 | `MAX_WORKFLOW_STEPS` | `10` | Plans with more steps are rejected |
 | `MAX_PLANNING_ATTEMPTS` | `2` | Planner attempts for retryable failures |
-| `MOCK_EXECUTION_ENABLED` | `true` | `false` makes `/execute` return 503 |
+| `MOCK_EXECUTION_ENABLED` | `true` | `false`: `/execute` and `/executions` return 503, and planning skips the mock document check |
 | `EXECUTION_MAX_ATTEMPTS` | `3` | Attempts per step (and per compensation) for transient errors (1–5) |
 | `EXECUTION_BACKOFF_BASE_SECONDS` | `0.2` | First retry delay; doubles each attempt |
 | `EXECUTION_BACKOFF_MAX_SECONDS` | `2.0` | Cap on any single retry delay |
@@ -108,11 +126,21 @@ Claude Code's login does **not** give your application an API key. Create one in
 ## Run tests
 
 ```powershell
+# Backend: 294 tests (includes live-server SSE and end-to-end scenarios on 127.0.0.1)
 cd C:\Projects\workflowweaver\backend
-.\.venv\Scripts\python.exe -m pytest -v
+.\.venv\Scripts\python.exe -m pytest -q
+
+# End-to-end report: real uvicorn server, 3 templates + fault scenarios, PASS/FAIL per scenario
+.\.venv\Scripts\python.exe -m scripts.e2e_check
+
+# Frontend: 31 tests, type check, production build
+cd C:\Projects\workflowweaver\frontend
+npm test
+npm run typecheck
+npm run build
 ```
 
-Tests never call the Claude API or any real Notion / Google Drive / Teams service: the Claude planner is tested with a fake client, and `ANTHROPIC_API_KEY` is removed from the environment for every test.
+Tests never call the Claude API or any real Notion / Google Drive / Teams service. The Claude planner is tested with a fake client, `ANTHROPIC_API_KEY` is removed from the environment for every test, and telemetry is pinned to a no-op. The only network traffic is to servers the tests start on `127.0.0.1`.
 
 ## Start the API
 
@@ -416,10 +444,16 @@ Latency is recorded on every observation (span timing plus `latency_ms` metadata
 
 ## Safety guarantees
 
-- `/plan` never executes anything; every planning response has `executed: false`. Execution is a separate, explicitly approved call to `/execute`.
-- Phase 3 execution uses **in-memory mock adapters only**: no network, MCP server or webhook is contacted, and Notion/Drive/Teams credentials are not read.
+- `/plan` never executes anything; every planning response has `executed: false`. Execution is a separate, explicitly approved call to `/execute` or `/executions`, and the plan is re-validated before anything runs.
+- Execution uses **in-memory mock adapters only**: no network, MCP server or webhook is contacted, and Notion/Drive/Teams credentials are not read.
+- SSE streams require a per-workflow capability token (mock-only access model, disabled when `APP_ENV=production`). The token is redacted from access and request logs.
+- No secrets reach the browser bundle, SSE events or Langfuse.
 - LLM output is untrusted: it is parsed into a Pydantic schema, then checked against an allow-list of integrations, actions and arguments.
 - Steps containing code or shell patterns (`rm -rf`, `$(...)`, `powershell`, `<script>`, `os.system(`, ...) are rejected.
 - Step count and planning retries are capped; dependencies may only point to earlier steps (no cycles).
 - Logs contain IDs, counts and error codes only, never instruction text, argument values or secrets.
 - All test data is synthetic.
+
+## Known limitations
+
+Mock integrations only, in-memory single-process state (no persistence, no multi-worker SSE), capability-token access model rather than user authentication, sequential step execution, and no failure-demo mode in the UI. The complete list and Phase 5 recommendations are in [docs/ARCHITECTURE.md §17-18](docs/ARCHITECTURE.md#17-known-limitations).

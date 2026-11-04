@@ -24,3 +24,6 @@ build/
 .idea/
 .DS_Store
 Thumbs.db
+
+# Docs tooling (throwaway venv for docs/diagrams/render_architecture.py)
+.docvenv/
