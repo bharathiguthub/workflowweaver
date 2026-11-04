@@ -12,15 +12,19 @@ from typing import Any, Literal
 
 from app.agents.planners.base import Planner, PlannerError
 from app.agents.state import WorkflowState
-from app.agents.validation import validate_draft
+from collections.abc import Collection
+
+from app.agents.validation import document_availability_issues, validate_draft
 from app.schemas.plan import DraftPlan
 
 logger = logging.getLogger(__name__)
 
 
 class PlanningNodes:
-    def __init__(self, planner: Planner) -> None:
+    def __init__(self, planner: Planner, *, available_documents: Collection[str] | None = None) -> None:
         self._planner = planner
+        # Set in mock execution mode: read_document targets must exist (see validation.py).
+        self._available_documents = available_documents
 
     def planner_node(self, state: WorkflowState) -> dict[str, Any]:
         attempt = state["planning_attempts"] + 1
@@ -70,6 +74,10 @@ class PlanningNodes:
     def validator_node(self, state: WorkflowState) -> dict[str, Any]:
         draft = DraftPlan.model_validate(state["draft_plan"])
         plan, issues = validate_draft(draft, max_steps=state["max_steps"])
+        if plan is not None and self._available_documents is not None:
+            issues = document_availability_issues(plan, self._available_documents)
+            if issues:
+                plan = None
         logger.info(
             "node=validator workflow_id=%s valid=%s issues=%s",
             state["workflow_id"], plan is not None, [i.code for i in issues],

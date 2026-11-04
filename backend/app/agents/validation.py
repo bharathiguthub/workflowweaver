@@ -6,6 +6,9 @@ No I/O and no LangGraph here, so every rule is unit-testable on its own.
 import re
 
 from app.agents.catalog import ACTION_CATALOG, normalize_integration
+from collections.abc import Collection
+
+from app.agents.synthetic_documents import canonical_document_name
 from app.schemas.plan import Action, DraftPlan, ValidationIssue, WorkflowPlan, WorkflowStep
 
 MAX_ARGUMENT_LENGTH = 5_000
@@ -178,3 +181,41 @@ def _unsafe(n: int, field: str, fragment: str) -> ValidationIssue:
         step_number=n,
         field=field,
     )
+
+
+def document_availability_issues(plan: WorkflowPlan, available_documents: Collection[str]) -> list[ValidationIssue]:
+    """Mock-mode check: every google_drive.read_document must name a document that will
+    exist when the step runs, i.e. one in ``available_documents`` (the synthetic catalog) or
+    the title of a create_document step EARLIER in this plan. Names are matched exactly,
+    exactly as the mock Drive adapter matches them.
+
+    The adapter's runtime DOCUMENT_NOT_FOUND check stays authoritative; this only moves the
+    failure for a deterministic mock catalog to before any side effect happens.
+    """
+    created: set[str] = set()
+    issues: list[ValidationIssue] = []
+    for step in plan.steps:  # steps run in step_number order
+        if step.integration.value != "google_drive":
+            continue
+        if step.action is Action.CREATE_DOCUMENT:
+            created.add(step.arguments.get("title", ""))
+        elif step.action is Action.READ_DOCUMENT:
+            name = step.arguments.get("document_name", "")
+            if name in available_documents or name in created:
+                continue
+            canonical = canonical_document_name(name)
+            hint = (
+                f" Did you mean '{canonical}'? Names must match exactly."
+                if canonical
+                else f" Available synthetic documents: {', '.join(sorted(available_documents))}."
+            )
+            issues.append(
+                ValidationIssue(
+                    code="DOCUMENT_NOT_FOUND",
+                    message=f"Step {step.step_number} reads '{name[:120]}', which is not in the synthetic Google Drive "
+                    f"catalog and is not created by an earlier step.{hint}",
+                    step_number=step.step_number,
+                    field="arguments.document_name",
+                )
+            )
+    return issues

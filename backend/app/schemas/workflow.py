@@ -67,3 +67,7 @@ class WorkflowTemplate(BaseModel):
     description: str
     steps: list[str]
     integrations: list[Integration]
+    example_instruction: str = Field(
+        description="Natural-language instruction for POST /plan that yields a valid plan which "
+        "executes successfully against the mock tools (synthetic data only)."
+    )

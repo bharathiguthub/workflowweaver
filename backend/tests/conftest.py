@@ -87,6 +87,17 @@ def fake_response(parsed_output, stop_reason: str = "end_turn"):
 
 
 @pytest.fixture(autouse=True)
+def _no_real_telemetry():
+    # Tests never export telemetry, even if the developer's .env sets LANGFUSE_ENABLED=true.
+    # Telemetry tests install their own recording/faulty implementations explicitly.
+    from app.observability import NoopTelemetry, set_telemetry
+
+    set_telemetry(NoopTelemetry())
+    yield
+    set_telemetry(NoopTelemetry())
+
+
+@pytest.fixture(autouse=True)
 def _no_real_anthropic_key(monkeypatch):
     # Guarantee no test can authenticate against the real API, even if the developer's
     # shell has a key set.

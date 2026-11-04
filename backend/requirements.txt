@@ -9,3 +9,6 @@ pytest==8.3.4
 langgraph==1.2.19
 anthropic==2.4.0
 pydantic-settings==2.16.2
+
+# Phase 4 - observability
+langfuse==5.1.0

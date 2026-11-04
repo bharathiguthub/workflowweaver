@@ -18,6 +18,7 @@ from app.agents.execution.nodes import ExecutionNodes, Sleeper, route_after_exec
 from app.agents.execution.retry import RetryPolicy
 from app.agents.execution.state import ExecutionState
 from app.agents.execution.tools.registry import MockToolRegistry
+from app.observability import traced_node
 
 
 def build_execution_graph(
@@ -26,15 +27,20 @@ def build_execution_graph(
     *,
     sleeper: Sleeper = time.sleep,
     rng: random.Random | None = None,
+    document_precheck: bool = True,
 ) -> CompiledStateGraph:
-    nodes = ExecutionNodes(registry, policy, sleeper, rng)
+    nodes = ExecutionNodes(registry, policy, sleeper, rng, document_precheck=document_precheck)
     graph = StateGraph(ExecutionState)
 
-    graph.add_node("prepare", nodes.prepare_node)
-    graph.add_node("execute_step", nodes.execute_step_node)
-    graph.add_node("retry_wait", nodes.retry_wait_node)
-    graph.add_node("compensate", nodes.compensate_node)
-    graph.add_node("finalize", nodes.finalize_node)
+    # Every node transition is a telemetry observation (no-op when Langfuse is disabled).
+    for name, fn in (
+        ("prepare", nodes.prepare_node),
+        ("execute_step", nodes.execute_step_node),
+        ("retry_wait", nodes.retry_wait_node),
+        ("compensate", nodes.compensate_node),
+        ("finalize", nodes.finalize_node),
+    ):
+        graph.add_node(name, traced_node("execution", name, fn))
 
     graph.add_edge(START, "prepare")
     graph.add_conditional_edges(

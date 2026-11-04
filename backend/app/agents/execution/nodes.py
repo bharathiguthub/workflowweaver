@@ -22,7 +22,10 @@ from app.agents.execution.tools.base import (
     ToolResult,
 )
 from app.agents.execution.tools.registry import MockToolRegistry
-from app.agents.validation import validate_draft
+from app.agents.validation import document_availability_issues, validate_draft
+from app.observability import get_telemetry
+from app.schemas.events import ExecutionEventType as Ev
+from app.streaming.emitter import emit
 from app.schemas.execution import (
     CompensationResult,
     CompensationStatus,
@@ -52,11 +55,13 @@ class ExecutionNodes:
         policy: RetryPolicy,
         sleeper: Sleeper,
         rng: random.Random | None = None,
+        document_precheck: bool = True,
     ) -> None:
         self._registry = registry
         self._policy = policy
         self._sleep = sleeper
         self._rng = rng
+        self._document_precheck = document_precheck
 
     # ---------- prepare ----------
 
@@ -92,6 +97,9 @@ class ExecutionNodes:
                 for s in plan.steps
                 if (s.integration, s.action) not in supported
             ]
+            if self._document_precheck:
+                # Reject before any side effect if a read targets a missing document.
+                issues += document_availability_issues(plan, self._registry.document_catalog())
         if plan is None or issues:
             logger.info("node=prepare workflow_id=%s rejected=invalid_plan issues=%d", state["workflow_id"], len(issues))
             return {
@@ -111,7 +119,18 @@ class ExecutionNodes:
                     ExecutionError(code="APPROVAL_REQUIRED", message="approval.approved must be true.").model_dump()
                 ],
             }
-        return {**update, "status": "running", "steps": [s.model_dump(mode="json") for s in plan.steps]}
+        steps = [s.model_dump(mode="json") for s in plan.steps]
+        emit(
+            Ev.WORKFLOW_STARTED,
+            step_count=len(steps),
+            max_attempts=self._policy.max_attempts,
+            steps=[
+                {"step_number": s["step_number"], "integration": s["integration"], "action": s["action"],
+                 "depends_on": s["depends_on"]}
+                for s in steps
+            ],
+        )
+        return {**update, "status": "running", "steps": steps}
 
     # ---------- execute ----------
 
@@ -131,21 +150,34 @@ class ExecutionNodes:
             attempt=attempt,
         )
         effect = self._registry.effect_of(integration, action)
+        emit(Ev.STEP_STARTED, step_number=n, attempt=attempt, integration=integration.value, action=action.value)
 
-        try:
-            result = self._registry.execute(call)
-            if effect is not Effect.READ_ONLY and not result.resource_id:
-                raise ToolError(ErrorKind.PERMANENT, "MALFORMED_TOOL_RESULT", "Tool returned no resource id.")
-        except ToolError as exc:
-            error = exc
-        except Exception:  # an adapter bug must not crash the graph
-            logger.exception("node=execute_step workflow_id=%s step=%d adapter crashed", state["workflow_id"], n)
-            error = ToolError(ErrorKind.PERMANENT, "TOOL_CRASHED", "Unexpected adapter error.")
-        else:
+        with get_telemetry().observe(
+            f"tool.{integration.value}.{action.value}",
+            as_type="tool",
+            workflow_id=call.workflow_id,
+            step_number=n,
+            # Argument NAMES only; values may contain user content.
+            input={"argument_names": sorted(call.arguments)},
+            metadata={"attempt": attempt, "effect": effect.value, "mode": "mock"},
+        ) as observation:
+            result, error = self._call_tool(call, effect)
+            if error is None:
+                observation.update(output={"resource_id": result.resource_id, "replayed": result.replayed})
+            else:
+                observation.update(
+                    output={"error_code": error.code, "error_kind": error.kind.value, "retryable": error.retryable},
+                    level="WARNING" if error.retryable else "ERROR",
+                    status_message=error.code,
+                )
+
+        if error is None:
             logger.info(
                 "node=execute_step workflow_id=%s step=%d attempt=%d ok replayed=%s",
                 state["workflow_id"], n, attempt, result.replayed,
             )
+            emit(Ev.STEP_SUCCEEDED, step_number=n, attempt=attempt, resource_id=result.resource_id,
+                 replayed=result.replayed)
             return {
                 "current_step": "execute_step",
                 "status": "running",
@@ -161,7 +193,11 @@ class ExecutionNodes:
             state["workflow_id"], n, attempt, error.code, error.retryable,
         )
         errors = [_error(error, n, attempt)]
-        if self._policy.should_retry(error, attempt):
+        will_retry = self._policy.should_retry(error, attempt)
+        emit(Ev.STEP_FAILED, step_number=n, attempt=attempt, error_code=error.code, error_kind=error.kind.value,
+             retryable=error.retryable, will_retry=will_retry,
+             retries_exhausted=error.retryable and not will_retry)
+        if will_retry:
             return {
                 "current_step": "execute_step",
                 "status": "retrying",
@@ -192,6 +228,20 @@ class ExecutionNodes:
             "journal": self._reconcile(call, effect, step),
         }
 
+    def _call_tool(self, call: ToolCall, effect: Effect) -> tuple[ToolResult | None, ToolError | None]:
+        try:
+            result = self._registry.execute(call)
+            if effect is not Effect.READ_ONLY and not result.resource_id:
+                raise ToolError(ErrorKind.PERMANENT, "MALFORMED_TOOL_RESULT", "Tool returned no resource id.")
+        except ToolError as exc:
+            return None, exc
+        except Exception:  # an adapter bug must not crash the graph
+            logger.exception(
+                "node=execute_step workflow_id=%s step=%d adapter crashed", call.workflow_id, call.step_number
+            )
+            return None, ToolError(ErrorKind.PERMANENT, "TOOL_CRASHED", "Unexpected adapter error.")
+        return result, None
+
     def _reconcile(self, call: ToolCall, effect: Effect, step: dict[str, Any]) -> list[dict[str, Any]]:
         """After a failure, check whether the effect happened anyway (e.g. timeout after the
         write, or a malformed response). If so, journal it so it is compensated too."""
@@ -202,6 +252,13 @@ class ExecutionNodes:
             return []
         logger.warning(
             "node=execute_step workflow_id=%s step=%d reconciled orphan effect", call.workflow_id, call.step_number
+        )
+        get_telemetry().event(
+            "execution.effect_reconciled",
+            workflow_id=call.workflow_id,
+            step_number=call.step_number,
+            metadata={"resource_id": found.resource_id, "effect": effect.value},
+            level="WARNING",
         )
         return [_journal_entry(step, found, effect, reconciled=True)]
 
@@ -230,7 +287,25 @@ class ExecutionNodes:
 
     def retry_wait_node(self, state: ExecutionState) -> dict[str, Any]:
         n = state["steps"][state["current_index"]]["step_number"]
-        delay = self._policy.delay_for(state["attempts"][str(n)], self._rng)
+        failed_attempt = state["attempts"][str(n)]
+        delay = self._policy.delay_for(failed_attempt, self._rng)
+        last_error = next((e for e in reversed(state["errors"]) if e.get("step_number") == n), {})
+        get_telemetry().event(
+            "execution.retry_scheduled",
+            workflow_id=state["workflow_id"],
+            step_number=n,
+            metadata={
+                "failed_attempt": failed_attempt,
+                "next_attempt": failed_attempt + 1,
+                "max_attempts": self._policy.max_attempts,
+                "delay_seconds": delay,
+                "error_code": last_error.get("code"),
+            },
+            level="WARNING",
+        )
+        emit(Ev.RETRY_SCHEDULED, step_number=n, phase="execution", failed_attempt=failed_attempt,
+             next_attempt=failed_attempt + 1, max_attempts=self._policy.max_attempts, delay_seconds=delay,
+             error_code=last_error.get("code"))
         self._sleep(delay)
         return {"current_step": "retry_wait", "retry_delays": [delay]}
 
@@ -243,7 +318,15 @@ class ExecutionNodes:
         errors: list[dict[str, Any]] = []
         delays: list[float] = []
         for entry in reversed(state["journal"]):
+            emit(Ev.COMPENSATION_STARTED, step_number=entry["step_number"], integration=entry["integration"],
+                 action=entry["action"], effect=entry["effect"], resource_id=entry["resource_id"])
             result, entry_errors, entry_delays = self._compensate_one(state["workflow_id"], entry)
+            if result.status is CompensationStatus.FAILED:
+                emit(Ev.COMPENSATION_FAILED, step_number=result.step_number, status=result.status.value,
+                     attempts=result.attempts, error_codes=[e["code"] for e in entry_errors])
+            else:
+                emit(Ev.COMPENSATION_COMPLETED, step_number=result.step_number, status=result.status.value,
+                     attempts=result.attempts)
             results.append(result.model_dump(mode="json"))
             errors.extend(entry_errors)
             delays.extend(entry_delays)
@@ -287,14 +370,24 @@ class ExecutionNodes:
                 resource_id=entry["resource_id"],
                 attempt=attempt,
             )
-            try:
-                undone = self._registry.compensate(call)
-            except ToolError as exc:
-                error = exc
-            except Exception:
-                logger.exception("node=compensate workflow_id=%s step=%d crashed", workflow_id, entry["step_number"])
-                error = ToolError(ErrorKind.PERMANENT, "COMPENSATION_CRASHED", "Unexpected adapter error.")
-            else:
+            with get_telemetry().observe(
+                f"compensation.{entry['integration']}.{entry['action']}",
+                as_type="tool",
+                workflow_id=workflow_id,
+                step_number=entry["step_number"],
+                input={"resource_id": entry["resource_id"]},
+                metadata={"attempt": attempt, "reconciled": entry.get("reconciled", False), "mode": "mock"},
+            ) as observation:
+                undone, error = self._call_compensation(call, workflow_id)
+                if error is None:
+                    observation.update(output={"undone": undone})
+                else:
+                    observation.update(
+                        output={"error_code": error.code, "retryable": error.retryable},
+                        level="WARNING" if self._policy.should_retry(error, attempt) else "ERROR",
+                        status_message=error.code,
+                    )
+            if error is None:
                 status = CompensationStatus.COMPENSATED if undone else CompensationStatus.ALREADY_COMPENSATED
                 logger.info(
                     "node=compensate workflow_id=%s step=%d attempt=%d status=%s",
@@ -320,14 +413,44 @@ class ExecutionNodes:
                     delays,
                 )
             delay = self._policy.delay_for(attempt, self._rng)
+            get_telemetry().event(
+                "execution.compensation_retry_scheduled",
+                workflow_id=workflow_id,
+                step_number=entry["step_number"],
+                metadata={"failed_attempt": attempt, "delay_seconds": delay, "error_code": error.code},
+                level="WARNING",
+            )
+            emit(Ev.RETRY_SCHEDULED, step_number=entry["step_number"], phase="compensation",
+                 failed_attempt=attempt, next_attempt=attempt + 1, max_attempts=self._policy.max_attempts,
+                 delay_seconds=delay, error_code=error.code)
             self._sleep(delay)
             delays.append(delay)
+
+    def _call_compensation(self, call: CompensationCall, workflow_id: str) -> tuple[bool, ToolError | None]:
+        try:
+            return self._registry.compensate(call), None
+        except ToolError as exc:
+            return False, exc
+        except Exception:
+            logger.exception("node=compensate workflow_id=%s step=%d crashed", workflow_id, call.step_number)
+            return False, ToolError(ErrorKind.PERMANENT, "COMPENSATION_CRASHED", "Unexpected adapter error.")
 
     # ---------- finalize ----------
 
     def finalize_node(self, state: ExecutionState) -> dict[str, Any]:
         status = final_status(state)
         logger.info("node=finalize workflow_id=%s status=%s", state["workflow_id"], status.value)
+        emit(
+            Ev.WORKFLOW_COMPLETED if status is ExecutionStatus.COMPLETED else Ev.WORKFLOW_FAILED,
+            status=status.value,
+            replayed=False,
+            failed_step=state["failed_step"],
+            attempts=state["attempts"],
+            step_statuses={str(r["step_number"]): r["status"] for r in state["step_results"]},
+            compensation_statuses={str(c["step_number"]): c["status"] for c in state["compensation_results"]},
+            error_codes=[e.get("code") for e in state["errors"]],
+            validation_issue_codes=[i.get("code") for i in state["validation_issues"]],
+        )
         return {"current_step": "finalize", "status": "finished", "final_status": status.value, "message": _MESSAGES[status]}
 
 

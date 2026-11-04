@@ -24,6 +24,7 @@ from app.agents.execution.nodes import Sleeper
 from app.agents.execution.retry import RetryPolicy
 from app.agents.execution.state import ExecutionState
 from app.agents.execution.tools.registry import MockToolRegistry
+from app.observability import get_telemetry
 from app.schemas.execution import (
     CompensationResult,
     ExecutionError,
@@ -48,11 +49,14 @@ class ExecutionService:
         max_steps: int,
         sleeper: Sleeper = time.sleep,
         rng: random.Random | None = None,
+        document_precheck: bool = True,
     ) -> None:
         self.registry = registry
         self.policy = policy
         self.max_steps = max_steps
-        self.graph = build_execution_graph(registry, policy, sleeper=sleeper, rng=rng)
+        self.graph = build_execution_graph(
+            registry, policy, sleeper=sleeper, rng=rng, document_precheck=document_precheck
+        )
         self._results: dict[str, tuple[str, ExecutionResponse]] = {}
         self._locks: dict[str, threading.Lock] = {}
         self._guard = threading.Lock()
@@ -65,20 +69,55 @@ class ExecutionService:
         stored = self._results.get(workflow_id)
         return stored[1] if stored else None
 
+    def check_conflict(self, request: ExecutionRequest) -> None:
+        """Raise IdempotencyConflict now if workflow_id already finished with another plan.
+        (execute() re-checks under the per-key lock; this is the fast pre-check for async starts.)"""
+        stored = self._results.get(str(request.workflow_id))
+        if stored is not None and stored[0] != plan_fingerprint(request):
+            raise IdempotencyConflict(f"workflow_id {request.workflow_id} was already executed with a different plan.")
+
     def execute(self, request: ExecutionRequest) -> ExecutionResponse:
         key = str(request.workflow_id)
         fingerprint = plan_fingerprint(request)
-        with self._lock_for(key):
-            stored = self._results.get(key)
-            if stored is not None:
-                if stored[0] != fingerprint:
-                    raise IdempotencyConflict(f"workflow_id {key} was already executed with a different plan.")
-                return stored[1].model_copy(update={"replayed": True})
+        telemetry = get_telemetry()
+        with telemetry.observe(
+            "execution.request",
+            as_type="agent",
+            workflow_id=key,
+            root=True,
+            input={
+                "step_count": len(request.plan.steps),
+                "steps": [
+                    {"step_number": s.step_number, "integration": s.integration, "action": s.action,
+                     "depends_on": s.depends_on}
+                    for s in request.plan.steps
+                ],
+                "approved": request.approval.approved,
+                "mode": request.approval.mode,
+            },
+            metadata={"plan_fingerprint": fingerprint[:16], "max_attempts": self.policy.max_attempts},
+        ) as observation:
+            with self._lock_for(key):
+                stored = self._results.get(key)
+                if stored is not None:
+                    if stored[0] != fingerprint:
+                        observation.update(level="WARNING", status_message="IDEMPOTENCY_CONFLICT",
+                                           output={"outcome": "IDEMPOTENCY_CONFLICT"})
+                        raise IdempotencyConflict(f"workflow_id {key} was already executed with a different plan.")
+                    replay = stored[1].model_copy(update={"replayed": True})
+                    observation.update(output=outcome_summary(replay), metadata={"replayed": True})
+                    return replay
 
-            state = self.run(request)
-            response = to_response(state)
-            if response.status is not ExecutionStatus.REJECTED:
-                self._results[key] = (fingerprint, response)
+                state = self.run(request)
+                response = to_response(state)
+                if response.status is not ExecutionStatus.REJECTED:
+                    self._results[key] = (fingerprint, response)
+
+            summary = outcome_summary(response)
+            level = _OUTCOME_LEVEL.get(response.status, "WARNING")
+            observation.update(output=summary, level=level, status_message=response.status.value,
+                               metadata={"replayed": False})
+            telemetry.event("execution.outcome", workflow_id=key, metadata=summary, level=level)
             return response
 
     def run(self, request: ExecutionRequest) -> ExecutionState:
@@ -92,6 +131,27 @@ class ExecutionService:
         )
         limit = execution_recursion_limit(len(request.plan.steps), self.policy.max_attempts)
         return self.graph.invoke(state, config={"recursion_limit": limit})
+
+
+_OUTCOME_LEVEL = {
+    ExecutionStatus.COMPLETED: "DEFAULT",
+    ExecutionStatus.COMPENSATION_FAILED: "ERROR",
+}
+
+
+def outcome_summary(response: ExecutionResponse) -> dict:
+    """Final outcome for telemetry: statuses, counts and codes only."""
+    return {
+        "status": response.status.value,
+        "replayed": response.replayed,
+        "attempts": response.attempts,
+        "total_attempts": sum(response.attempts.values()),
+        "retry_count": len(response.retry_delays_seconds),
+        "retry_delays_seconds": response.retry_delays_seconds,
+        "step_statuses": {str(r.step_number): r.status.value for r in response.step_results},
+        "error_codes": [e.code for e in response.errors],
+        "compensation_statuses": {str(c.step_number): c.status.value for c in response.compensation_results},
+    }
 
 
 def plan_fingerprint(request: ExecutionRequest) -> str:

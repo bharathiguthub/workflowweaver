@@ -8,6 +8,7 @@ import hashlib
 from typing import Any
 
 from app.agents.catalog import ACTION_CATALOG
+from app.agents.synthetic_documents import SYNTHETIC_DRIVE_DOCUMENTS
 from app.agents.execution.tools.base import (
     CompensationCall,
     Effect,
@@ -19,12 +20,8 @@ from app.agents.execution.tools.base import (
 from app.schemas.plan import Action
 from app.schemas.workflow import Integration
 
-# Synthetic documents available to google_drive.read_document.
-DRIVE_FIXTURES: dict[str, str] = {
-    "Synthetic standup notes": "Alice drafts the roadmap by Friday. Bob reviews the API spec.",
-    "Synthetic sprint backlog": "WW-1 Login page; WW-2 Export CSV; WW-3 Fix flaky test.",
-    "Synthetic incident report": "SEV-3: synthetic latency spike on staging, mitigated.",
-}
+# Synthetic documents available to google_drive.read_document (shared with the mock planner).
+DRIVE_FIXTURES: dict[str, str] = SYNTHETIC_DRIVE_DOCUMENTS
 
 
 def synthetic_id(prefix: str, key: str) -> str:

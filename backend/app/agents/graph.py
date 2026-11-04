@@ -5,6 +5,7 @@
                    \\--(failed)--------------------------------------------------> error
 """
 
+from collections.abc import Collection
 from uuid import uuid4
 
 from langgraph.graph import END, START, StateGraph
@@ -13,16 +14,18 @@ from langgraph.graph.state import CompiledStateGraph
 from app.agents.nodes import PlanningNodes, route_after_planner, route_after_validator
 from app.agents.planners.base import Planner
 from app.agents.state import WorkflowState
+from app.observability import traced_node
 
 
-def build_planning_graph(planner: Planner) -> CompiledStateGraph:
-    nodes = PlanningNodes(planner)
+def build_planning_graph(planner: Planner, *, available_documents: Collection[str] | None = None) -> CompiledStateGraph:
+    nodes = PlanningNodes(planner, available_documents=available_documents)
     graph = StateGraph(WorkflowState)
 
-    graph.add_node("planner", nodes.planner_node)
-    graph.add_node("validator", nodes.validator_node)
-    graph.add_node("reporter", nodes.reporter_node)
-    graph.add_node("error", nodes.error_node)
+    # Each node is wrapped so every transition is a telemetry observation (no-op if disabled).
+    graph.add_node("planner", traced_node("planning", "planner", nodes.planner_node))
+    graph.add_node("validator", traced_node("planning", "validator", nodes.validator_node))
+    graph.add_node("reporter", traced_node("planning", "reporter", nodes.reporter_node))
+    graph.add_node("error", traced_node("planning", "error", nodes.error_node))
 
     graph.add_edge(START, "planner")
     graph.add_conditional_edges(

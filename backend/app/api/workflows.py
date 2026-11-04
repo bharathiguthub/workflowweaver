@@ -28,6 +28,10 @@ TEMPLATES: list[WorkflowTemplate] = [
             "Notify attendees in Teams",
         ],
         integrations=[Integration.GOOGLE_DRIVE, Integration.NOTION, Integration.TEAMS],
+        example_instruction=(
+            "Read 'Synthetic standup notes' from Google Drive, create Notion tasks for each action item, "
+            "save the meeting minutes to Google Drive, and notify attendees in Microsoft Teams."
+        ),
     ),
     WorkflowTemplate(
         id="sprint-planning",
@@ -40,6 +44,10 @@ TEMPLATES: list[WorkflowTemplate] = [
             "Share sprint summary in Teams",
         ],
         integrations=[Integration.NOTION, Integration.TEAMS],
+        example_instruction=(
+            "Load the sprint backlog, draft the sprint plan page in Notion, "
+            "and share the sprint summary in Microsoft Teams."
+        ),
     ),
     WorkflowTemplate(
         id="incident-response",
@@ -52,6 +60,10 @@ TEMPLATES: list[WorkflowTemplate] = [
             "Create post-mortem document in Google Drive",
         ],
         integrations=[Integration.TEAMS, Integration.GOOGLE_DRIVE],
+        example_instruction=(
+            "Read 'Synthetic incident report' from Google Drive, alert the on-call channel in Microsoft Teams, "
+            "and create a post-mortem document in Google Drive."
+        ),
     ),
 ]
 TEMPLATES_BY_ID = {t.id: t for t in TEMPLATES}

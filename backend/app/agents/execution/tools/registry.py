@@ -12,6 +12,7 @@ from app.agents.execution.tools.base import (
 )
 from app.agents.execution.tools.faults import Fault, FailureInjector
 from app.agents.execution.tools.mock import (
+    DRIVE_FIXTURES,
     MockGoogleDriveAdapter,
     MockNotionAdapter,
     MockTeamsAdapter,
@@ -55,6 +56,10 @@ class MockToolRegistry:
                     continue
                 supported.add((integration, action))
         return supported
+
+    def document_catalog(self) -> frozenset[str]:
+        """Names google_drive.read_document can serve without an earlier create step."""
+        return frozenset(DRIVE_FIXTURES)
 
     def effect_of(self, integration: Integration, action: Action) -> Effect:
         return self.adapters[integration].effect_of(action)

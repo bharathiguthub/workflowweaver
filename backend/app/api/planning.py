@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 
 from app.agents.planners import PlannerConfigError, create_planner
 from app.agents.service import PlanningService
+from app.agents.synthetic_documents import SYNTHETIC_DRIVE_DOCUMENTS
 from app.core.config import get_settings
 from app.schemas.plan import PlanRequest, PlanResponse, PlanStatus
 
@@ -34,6 +35,8 @@ def _default_service() -> PlanningService:
         create_planner(settings),
         max_steps=settings.max_workflow_steps,
         max_planning_attempts=settings.max_planning_attempts,
+        # Mock execution reads only synthetic documents, so plans are checked against them.
+        available_documents=frozenset(SYNTHETIC_DRIVE_DOCUMENTS) if settings.mock_execution_enabled else None,
     )
 
 
