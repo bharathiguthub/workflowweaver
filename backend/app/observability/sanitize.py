@@ -11,6 +11,8 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
+from app.integrations.secrets import scrub_secrets
+
 REDACTED = "[REDACTED]"
 MAX_STRING = 200
 MAX_ITEMS = 50
@@ -43,7 +45,7 @@ _SECRET_VALUE = re.compile(
 
 
 def scrub_text(value: str) -> str:
-    value = _SECRET_VALUE.sub(REDACTED, value)
+    value = _SECRET_VALUE.sub(REDACTED, scrub_secrets(value))
     if len(value) > MAX_STRING:
         value = value[:MAX_STRING] + f"...[truncated {len(value) - MAX_STRING} chars]"
     return value

@@ -81,7 +81,7 @@ def test_invalid_plan_is_422_with_issues(client_for):
 @pytest.mark.parametrize(
     "mutate",
     [
-        lambda b: b["approval"].update(mode="real"),  # only mock execution exists
+        lambda b: b["approval"].update(mode="production"),  # not a mode at all
         lambda b: b["approval"].pop("approved_by"),
         lambda b: b.update(faults={"2": ["permanent"]}),  # fault injection never via API
         lambda b: b.update(workflow_id="not-a-uuid"),
@@ -92,6 +92,20 @@ def test_bad_request_bodies_are_422(client_for, mutate):
     payload = body()
     mutate(payload)
     assert client.post(URL, json=payload).status_code == 422
+    assert service.registry.store.calls == []
+
+
+@pytest.mark.parametrize("mode", ["real", "dry_run"])
+def test_mode_other_than_the_servers_is_409_and_nothing_runs(client_for, mode):
+    # Phase 5.1: "real"/"dry_run" are valid values, but the mode is chosen by the server
+    # (INTEGRATION_MODE, default mock); a client can never escalate it.
+    client, service = client_for()
+    payload = body()
+    payload["approval"]["mode"] = mode
+    response = client.post(URL, json=payload)
+    assert response.status_code == 409
+    assert response.json()["status"] == "REJECTED" and response.json()["mode"] == "mock"
+    assert [e["code"] for e in response.json()["errors"]] == ["MODE_MISMATCH"]
     assert service.registry.store.calls == []
 
 

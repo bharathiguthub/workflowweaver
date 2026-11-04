@@ -3,7 +3,8 @@
 POST /api/v1/workflows/executions
     Body: ExecutionRequest (same as POST /execute). Starts the run on a worker thread.
     202  ExecutionStartResponse {stream_url, stream_token, result_url}
-    409  workflow_id already executed with a different plan, or its stream is still active
+    409  workflow_id already executed with a different plan, its stream is still active,
+         or approval.mode does not match the server's INTEGRATION_MODE
     422  invalid body
     503  streaming disabled (MOCK_EXECUTION_ENABLED=false or APP_ENV=production) / at capacity
 
@@ -30,9 +31,10 @@ from functools import lru_cache
 from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, Response, status
 from fastapi.responses import StreamingResponse
 
-from app.agents.execution.service import IdempotencyConflict
-from app.api.execution import _default_service
+from app.agents.execution.service import IdempotencyConflict, ModeMismatch
+from app.api.execution import _default_service, get_write_authorization
 from app.core.config import get_settings
+from app.integrations.errors import IntegrationConfigError
 from app.schemas.events import ExecutionEvent, ExecutionStartResponse
 from app.schemas.execution import ExecutionRequest
 from app.streaming.broker import BrokerFull, ChannelBusy, EventBroker, EventChannel
@@ -63,7 +65,10 @@ def get_execution_runner() -> ExecutionRunner:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Streaming uses a mock-only access model and is disabled when APP_ENV=production.",
         )
-    return _default_runner()
+    try:
+        return _default_runner()
+    except IntegrationConfigError as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
 
 
 def get_heartbeat_seconds() -> float:
@@ -134,11 +139,13 @@ async def event_stream(
                503: {"description": "Streaming disabled or at capacity"}},
 )
 def start_execution(
-    payload: ExecutionRequest, runner: ExecutionRunner = Depends(get_execution_runner)
+    payload: ExecutionRequest,
+    runner: ExecutionRunner = Depends(get_execution_runner),
+    write_authorized: bool = Depends(get_write_authorization),
 ) -> ExecutionStartResponse:
     try:
-        channel, _ = runner.start(payload)
-    except IdempotencyConflict as exc:
+        channel, _ = runner.start(payload, write_authorized=write_authorized)
+    except (IdempotencyConflict, ModeMismatch) as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, str(exc)) from exc
     except ChannelBusy as exc:
         raise HTTPException(status.HTTP_409_CONFLICT, "An execution stream for this workflow_id is already active.") from exc
@@ -147,6 +154,7 @@ def start_execution(
     wf = str(payload.workflow_id)
     return ExecutionStartResponse(
         workflow_id=payload.workflow_id,
+        mode=runner.service.registry.mode.value,
         stream_url=f"/api/v1/workflows/executions/{wf}/events?access_token={channel.token}",
         stream_token=channel.token,
         result_url=f"/api/v1/workflows/executions/{wf}",

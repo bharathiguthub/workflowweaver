@@ -1,4 +1,4 @@
-"""Builds the LangGraph execution graph (Phase 3, mock tools only).
+"""Builds the LangGraph execution graph (mock, dry-run or real tools; see ToolRegistry).
 
     START -> prepare --(rejected)--------------------------------------------> finalize -> END
                 \\--(running)--> execute_step --(succeeded, more steps)--> execute_step
@@ -17,12 +17,12 @@ from langgraph.graph.state import CompiledStateGraph
 from app.agents.execution.nodes import ExecutionNodes, Sleeper, route_after_execute, route_after_prepare
 from app.agents.execution.retry import RetryPolicy
 from app.agents.execution.state import ExecutionState
-from app.agents.execution.tools.registry import MockToolRegistry
+from app.agents.execution.tools.registry import ToolRegistry
 from app.observability import traced_node
 
 
 def build_execution_graph(
-    registry: MockToolRegistry,
+    registry: ToolRegistry,
     policy: RetryPolicy,
     *,
     sleeper: Sleeper = time.sleep,
@@ -70,12 +70,18 @@ def initial_execution_state(
     approved_by: str,
     max_steps: int,
     max_attempts: int,
+    mode: str = "mock",
+    requested_mode: str = "mock",
+    write_authorized: bool = False,
 ) -> ExecutionState:
     return ExecutionState(
         workflow_id=workflow_id,
         approved=approved,
         approved_by=approved_by,
         raw_plan=raw_plan,
+        mode=mode,
+        requested_mode=requested_mode,
+        write_authorized=write_authorized,
         steps=[],
         validation_issues=[],
         current_step="start",

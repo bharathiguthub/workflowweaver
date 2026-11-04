@@ -1,4 +1,4 @@
-"""Pydantic schemas for Phase 3 mock execution.
+"""Pydantic schemas for workflow execution (mock, dry-run or real integrations).
 
 Final workflow statuses
 -----------------------
@@ -19,6 +19,9 @@ from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field
 
 from app.schemas.plan import ValidationResult
+
+
+ExecutionMode = Literal["mock", "dry_run", "real"]
 
 
 class ExecutionStatus(str, Enum):
@@ -52,7 +55,10 @@ class ExecutionApproval(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     approved: bool = Field(description="Must be true to execute.")
-    mode: Literal["mock"] = Field(description="Only 'mock' execution exists in Phase 3.")
+    mode: ExecutionMode = Field(
+        description="Must equal the server's INTEGRATION_MODE. Confirms which mode the approver "
+        "approved; it never selects or changes the mode."
+    )
     approved_by: str = Field(min_length=3, max_length=80, examples=["synthetic.reviewer"])
 
 
@@ -118,7 +124,7 @@ class CompensationResult(BaseModel):
 class ExecutionResponse(BaseModel):
     workflow_id: UUID
     status: ExecutionStatus
-    mode: Literal["mock"] = "mock"
+    mode: ExecutionMode = "mock"
     validation: ValidationResult
     step_results: list[StepResult]
     attempts: dict[str, int] = Field(description="Attempts per step_number")

@@ -9,6 +9,8 @@ record's message and arguments to ``access_token=[REDACTED]``.
 import logging
 import re
 
+from app.integrations.secrets import scrub_secrets
+
 _TOKEN = re.compile(r"(access_token=)[^&\s\"']+", re.IGNORECASE)
 REDACTED = r"\1[REDACTED]"
 
@@ -18,12 +20,13 @@ URL_LOGGERS = ("uvicorn.access", "uvicorn.error", "httpx")
 
 def redact(value: object) -> object:
     if isinstance(value, str):
-        return _TOKEN.sub(REDACTED, value)
+        return scrub_secrets(_TOKEN.sub(REDACTED, value))
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     # e.g. httpx logs request.url as an httpx.URL object, not a str.
     text = str(value)
-    return _TOKEN.sub(REDACTED, text) if _TOKEN.search(text) else value
+    scrubbed = scrub_secrets(_TOKEN.sub(REDACTED, text))
+    return scrubbed if scrubbed != text else value
 
 
 class TokenRedactingFilter(logging.Filter):
@@ -37,6 +40,15 @@ class TokenRedactingFilter(logging.Filter):
         except Exception:  # never drop a log line because redaction failed
             pass
         return True
+
+
+def install_secret_redaction() -> None:
+    """Attach the filter to every root handler too, so configured integration secrets are
+    scrubbed from records of any logger (idempotent). Handler filters see every record
+    that reaches the handler, including those propagated from child loggers."""
+    for handler in logging.getLogger().handlers:
+        if not any(isinstance(f, TokenRedactingFilter) for f in handler.filters):
+            handler.addFilter(TokenRedactingFilter())
 
 
 def install_token_redaction() -> None:

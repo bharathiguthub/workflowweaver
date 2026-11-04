@@ -32,16 +32,17 @@ class ExecutionRunner:
         self.broker = broker
         self._executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="ww-exec")
 
-    def start(self, request: ExecutionRequest) -> tuple[EventChannel, Future]:
+    def start(self, request: ExecutionRequest, *, write_authorized: bool = False) -> tuple[EventChannel, Future]:
         """Raises IdempotencyConflict (different plan), ChannelBusy (stream active) or BrokerFull."""
         self.service.check_conflict(request)
         channel = self.broker.create(str(request.workflow_id))
-        return channel, self._executor.submit(self._run, request, channel)
+        return channel, self._executor.submit(self._run, request, channel, write_authorized)
 
-    def _run(self, request: ExecutionRequest, channel: EventChannel) -> ExecutionResponse | None:
+    def _run(self, request: ExecutionRequest, channel: EventChannel,
+             write_authorized: bool = False) -> ExecutionResponse | None:
         token = set_publisher(channel)
         try:
-            response = self.service.execute(request)
+            response = self.service.execute(request, write_authorized=write_authorized)
         except Exception as exc:  # incl. IdempotencyConflict raced in after start()
             logger.warning(
                 "async execution workflow_id=%s failed error=%s", channel.workflow_id, type(exc).__name__

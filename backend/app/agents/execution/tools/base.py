@@ -51,6 +51,9 @@ class ToolCall:
     action: Action
     arguments: dict[str, str]
     attempt: int = 1
+    # Server-verified authorization for real side effects (operator token checked by the
+    # API). Real adapters refuse writes without it; mock and dry-run adapters ignore it.
+    write_authorized: bool = False
 
     @property
     def idempotency_key(self) -> str:

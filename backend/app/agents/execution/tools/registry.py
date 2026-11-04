@@ -1,4 +1,15 @@
-"""MockToolRegistry: routes a typed ToolCall to the adapter for its integration."""
+"""ToolRegistry: routes a typed ToolCall to the adapter for its integration.
+
+One registry implementation serves every integration mode; only the adapters differ:
+  mock     MockToolRegistry (in-memory adapters, synthetic documents)
+  dry_run  real adapters with no sender: they validate and build requests, send nothing
+  real     real adapters with MCP / webhook clients
+The execution graph, retries, idempotency and Saga compensation are identical in all modes.
+
+Test-only failure injection (``faults``) works in every mode and is refused in production.
+"""
+
+from collections.abc import Collection
 
 from app.agents.catalog import ACTION_CATALOG
 from app.agents.execution.tools.base import (
@@ -18,8 +29,8 @@ from app.agents.execution.tools.mock import (
     MockTeamsAdapter,
     MockToolStore,
 )
-from app.core.config import Settings
-from app.schemas.plan import Action
+from app.core.config import IntegrationMode, Settings
+from app.schemas.plan import Action, ValidationIssue, WorkflowStep
 from app.schemas.workflow import Integration
 
 _FAULT_ERRORS = {
@@ -35,16 +46,22 @@ def _raise(fault: Fault) -> None:
     raise ToolError(kind, code, message)
 
 
-class MockToolRegistry:
-    def __init__(self, store: MockToolStore | None = None, faults: FailureInjector | None = None) -> None:
-        self.store = store or MockToolStore()
+class ToolRegistry:
+    def __init__(
+        self,
+        adapters: list[ToolAdapter],
+        *,
+        mode: IntegrationMode = IntegrationMode.MOCK,
+        faults: FailureInjector | None = None,
+        documents: Collection[str] | None = None,
+        real_writes_enabled: bool = False,
+    ) -> None:
+        self.mode = mode
         self.faults = faults
-        adapters: list[ToolAdapter] = [
-            MockNotionAdapter(self.store),
-            MockGoogleDriveAdapter(self.store),
-            MockTeamsAdapter(self.store),
-        ]
         self.adapters: dict[Integration, ToolAdapter] = {a.integration: a for a in adapters}
+        self._documents = frozenset(documents) if documents is not None else None
+        # Only meaningful in REAL mode: the server-wide kill switch for side effects.
+        self.real_writes_enabled = real_writes_enabled
 
     def supported_actions(self) -> set[tuple[Integration, Action]]:
         supported = set()
@@ -57,9 +74,23 @@ class MockToolRegistry:
                 supported.add((integration, action))
         return supported
 
-    def document_catalog(self) -> frozenset[str]:
-        """Names google_drive.read_document can serve without an earlier create step."""
-        return frozenset(DRIVE_FIXTURES)
+    def document_catalog(self) -> frozenset[str] | None:
+        """Names google_drive.read_document can serve without an earlier create step, or
+        None when the catalog is not known offline (real/dry-run: the precheck is skipped)."""
+        return self._documents
+
+    def preflight_issues(self, steps: list[WorkflowStep]) -> list[ValidationIssue]:
+        """Pure, network-free checks run before anything executes (e.g. approved
+        destinations). Adapters opt in by defining ``preflight(integration, action, arguments)``."""
+        issues: list[ValidationIssue] = []
+        for step in steps:
+            adapter = self.adapters.get(step.integration)
+            check = getattr(adapter, "preflight", None)
+            if check is None:
+                continue
+            for code, message in check(step.action, step.arguments):
+                issues.append(ValidationIssue(code=code, message=message, step_number=step.step_number))
+        return issues
 
     def effect_of(self, integration: Integration, action: Action) -> Effect:
         return self.adapters[integration].effect_of(action)
@@ -91,8 +122,38 @@ class MockToolRegistry:
             _raise(fault)
         return self.adapters[call.integration].compensate(call)
 
+    def close(self) -> None:
+        """Release network clients (MCP sessions, HTTP pools). Never raises."""
+        for adapter in self.adapters.values():
+            close = getattr(adapter, "close", None)
+            if close is not None:
+                try:
+                    close()
+                except Exception:
+                    pass
 
-def create_tool_registry(settings: Settings, faults: FailureInjector | None = None) -> MockToolRegistry:
+
+class MockToolRegistry(ToolRegistry):
+    def __init__(self, store: MockToolStore | None = None, faults: FailureInjector | None = None) -> None:
+        self.store = store or MockToolStore()
+        super().__init__(
+            [MockNotionAdapter(self.store), MockGoogleDriveAdapter(self.store), MockTeamsAdapter(self.store)],
+            mode=IntegrationMode.MOCK,
+            faults=faults,
+            documents=DRIVE_FIXTURES,
+        )
+
+
+def create_tool_registry(settings: Settings, faults: FailureInjector | None = None, **clients) -> ToolRegistry:
+    """Build the registry for ``settings.integration_mode``. Never opens a connection.
+
+    ``clients`` (tests only) injects fake transports into the real adapters; see
+    ``app.agents.execution.tools.integrations.build_integration_registry``."""
     if faults is not None and settings.app_env.lower() == "production":
         raise RuntimeError("Failure injection is disabled when APP_ENV=production.")
-    return MockToolRegistry(faults=faults)
+    if settings.integration_mode is IntegrationMode.MOCK:
+        return MockToolRegistry(faults=faults)
+    # Imported lazily: the integration layer imports this package's base module.
+    from app.agents.execution.tools.integrations import build_integration_registry
+
+    return build_integration_registry(settings, faults=faults, **clients)

@@ -10,7 +10,7 @@ FDE Capstone: an AI workflow orchestrator that turns unstructured input (meeting
 |---|---|
 | API | FastAPI: REST + Server-Sent Events for live progress |
 | Orchestration | LangGraph: planning graph + execution graph (retries, Saga compensation); Claude or mock planner |
-| Integrations | **Mock** Notion / Google Drive / Teams adapters (Phase 4). Real Notion MCP, Google Drive MCP, Teams webhook: Phase 5 |
+| Integrations | Server-selected mode: **mock** (default), **dry_run**, or **real** (Notion MCP, Google Drive MCP, Teams webhook; foundation only, tested against fakes) |
 | Observability | Langfuse Python SDK v5 (optional, failure-isolated) |
 | Frontend | React 19 + TypeScript + Vite 8 + Tailwind CSS 4 (`frontend/`) |
 
@@ -22,7 +22,8 @@ FDE Capstone: an AI workflow orchestrator that turns unstructured input (meeting
 | 2 | LangGraph planning agent: natural language → validated plan | Done |
 | 3 | LangGraph execution graph over **mock** tools: approval gate, bounded retries, idempotency, Saga compensation | **Done (mock only)** |
 | 4 | Langfuse observability, SSE live progress, React + Tailwind UI, mock document validation, integration and reliability testing | **Done (mock only)** |
-| 5 | Real Notion / Drive MCP and Teams webhook adapters, persistence, authentication | Planned |
+| 5.1 | Real-integration foundation: integration modes, MCP + webhook clients, approved destinations, write authorization, secret redaction | **Done (fakes only; no real service connected)** |
+| 5.2+ | Connect and verify real Notion / Drive MCP servers and Teams webhooks, durable persistence, user authentication | Planned |
 
 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) describes the implementation in detail: both LangGraph graphs, state, the SSE transport, observability, security boundaries, a real worked example, test inventory, limitations and Phase 5 recommendations.
 
@@ -54,6 +55,7 @@ Open http://127.0.0.1:5173, pick a template, click **Generate Plan**, review it,
 | GET | `/api/v1/workflows/executions/{workflow_id}` | 3 | Stored result of a finished execution (404 if unknown) |
 | POST | `/api/v1/workflows/executions` | 4 | Start a **mock** execution in the background; returns 202 + stream URL/token |
 | GET | `/api/v1/workflows/executions/{workflow_id}/events` | 4 | Live progress as Server-Sent Events (token required) |
+| GET | `/api/v1/integrations/status` | 5.1 | Integration mode, write switches and destination **aliases** (never URLs, ids or secrets) |
 
 `POST /api/v1/workflows/plan` status codes:
 
@@ -120,13 +122,24 @@ Settings come from environment variables, or from `C:\Projects\workflowweaver\.e
 | `LANGFUSE_PUBLIC_KEY` | — | Langfuse project public key |
 | `LANGFUSE_SECRET_KEY` | — | Langfuse project secret key (secret; never logged) |
 | `LANGFUSE_BASE_URL` | SDK default | e.g. `https://cloud.langfuse.com`, `https://us.cloud.langfuse.com`, or self-hosted |
+| `INTEGRATION_MODE` | `mock` | `mock`, `dry_run` or `real`; see [Real integrations](#real-integrations-phase-51-foundation) |
+| `REAL_WRITES_ENABLED` | `false` | Kill switch for side effects in real mode |
+| `REAL_WRITE_AUTHORIZATION_TOKEN` | — | Operator token required (header `X-Integration-Authorization`) for real writes (secret) |
+| `INTEGRATION_CONNECT_TIMEOUT_SECONDS` / `INTEGRATION_TIMEOUT_SECONDS` | `5` / `20` | Timeouts for every MCP / webhook request |
+| `NOTION_MCP_URL`, `NOTION_MCP_AUTH_TOKEN` | — | Notion MCP server (Streamable HTTP; https, or http on loopback) and its bearer token (secret) |
+| `NOTION_MCP_TOOL_ALLOWLIST`, `NOTION_TOOL_*` | `API-post-page,API-patch-page` | The only MCP tools that may be called, and which one does what |
+| `NOTION_DESTINATIONS`, `NOTION_DEFAULT_PAGE_PARENT`, `NOTION_TASK_DATABASE` | `{}` | Approved destinations: JSON alias → page/database id |
+| `GOOGLE_DRIVE_MCP_URL`, `GOOGLE_DRIVE_MCP_AUTH_TOKEN`, `GOOGLE_DRIVE_MCP_TOOL_ALLOWLIST`, `GOOGLE_DRIVE_TOOL_*` | — | Google Drive MCP server, token, allowlist and tool names |
+| `GOOGLE_DRIVE_DESTINATIONS`, `GOOGLE_DRIVE_DEFAULT_FOLDER` | `{}` | Approved folders: JSON alias → folder id (writes **and** reads are confined to them) |
+| `TEAMS_WEBHOOK_URLS`, `TEAMS_DEFAULT_CHANNEL` | — | Secret JSON alias → Teams webhook URL (https only); approved channels are its aliases |
 
 Claude Code's login does **not** give your application an API key. Create one in the Claude Console and set it only in your shell or in `.env`.
 
 ## Run tests
 
 ```powershell
-# Backend: 294 tests (includes live-server SSE and end-to-end scenarios on 127.0.0.1)
+# Backend: 401 tests (includes live-server SSE and end-to-end scenarios on 127.0.0.1,
+# and Phase 5.1 integration tests against fake MCP servers / webhooks)
 cd C:\Projects\workflowweaver\backend
 .\.venv\Scripts\python.exe -m pytest -q
 
@@ -140,7 +153,7 @@ npm run typecheck
 npm run build
 ```
 
-Tests never call the Claude API or any real Notion / Google Drive / Teams service. The Claude planner is tested with a fake client, `ANTHROPIC_API_KEY` is removed from the environment for every test, and telemetry is pinned to a no-op. The only network traffic is to servers the tests start on `127.0.0.1`.
+Tests never call the Claude API or any real Notion / Google Drive / Teams service. The Claude planner is tested with a fake client, `ANTHROPIC_API_KEY` is removed from the environment for every test, and telemetry is pinned to a no-op. Integration tests use an in-memory fake MCP server, `httpx.MockTransport` and a recording webhook sender. An autouse fixture (`tests/conftest.py`) removes integration env vars and **blocks every non-loopback connection** — sync and async httpx, `socket.connect`, DNS lookups (so also urllib and any SDK) — so a test that tries to reach a real service fails. The only network traffic is to servers the tests start on `127.0.0.1`.
 
 ## Start the API
 
@@ -442,10 +455,83 @@ Latency is recorded on every observation (span timing plus `latency_ms` metadata
 
 > Note: `langsmith` is installed as a transitive dependency of LangGraph. Do not set `LANGSMITH_TRACING=true`: LangSmith tracing would capture full graph state, including instruction text.
 
+## Real integrations (Phase 5.1 foundation)
+
+Stage 5.1 adds the infrastructure for real Notion, Google Drive and Microsoft Teams calls **without connecting to any real service**. Everything is exercised against fakes; mock mode stays the default and the UI is unchanged.
+
+### Integration modes (server-controlled)
+
+| `INTEGRATION_MODE` | Adapters | Network | Use |
+|---|---|---|---|
+| `mock` (default) | In-memory mocks, synthetic documents | none | Development, demos, all Phase 1–4 behaviour |
+| `dry_run` | Real adapters, no sender | **none** (no client is even created) | Validate destinations, authorization and request shapes before going live |
+| `real` | Real adapters + MCP / webhook clients | configured servers only | Stage 5.2+, after verification against real servers |
+
+The mode is read from server configuration only. Every execution request's `approval.mode` must **equal** it; a mismatch is rejected with HTTP 409 `MODE_MISMATCH` before anything runs (the streaming endpoint checks before creating a stream). A client therefore can neither select nor escalate the mode.
+
+The same LangGraph execution graph, retry policy, request idempotency, Saga compensation, SSE events and Langfuse spans are used in every mode. Only the adapters behind `ToolRegistry` change.
+
+### Authorization for real writes
+
+A plan containing any write step (`create_page`, `create_task`, `create_document`, `send_message`) runs in real mode only if **all** of these hold. Otherwise it is rejected in `prepare`, before any call:
+
+1. `approval.approved: true` (as before; otherwise 403 `APPROVAL_REQUIRED`).
+2. `REAL_WRITES_ENABLED=true` (otherwise 403 `REAL_WRITES_DISABLED`).
+3. The request carries `X-Integration-Authorization: <REAL_WRITE_AUTHORIZATION_TOKEN>`, compared in constant time (otherwise 403 `REAL_WRITE_AUTHORIZATION_REQUIRED`). The adapters re-check this per call (`REAL_WRITE_NOT_AUTHORIZED`).
+4. Every destination is **approved**. Plans name destinations by alias only (`parent`, `folder`, `channel`, or the configured default). An unknown alias, or a raw id or URL, is rejected with 422 `DESTINATION_NOT_APPROVED`. Notion tasks always go to `NOTION_TASK_DATABASE`.
+
+Read-only plans (`read_document`) need no write authorization, but reads are confined to the approved Drive folders: the search is scoped to them, and each match is re-checked.
+
+### Components
+
+| Module | Responsibility |
+|---|---|
+| `app/integrations/config.py` | Validates settings: https-only URLs (http on loopback for local MCP servers), no credentials in URLs, alias maps, tool allowlists. Errors name the setting, never the value |
+| `app/integrations/mcp/client.py` | Reusable MCP client: lazy connect, `initialize` handshake + protocol-version check, paginated `tools/list` discovery filtered to the allowlist, `tools/call` with typed `McpToolResult`, session-expiry reconnect, thread-safe, `close()` |
+| `app/integrations/mcp/transport.py` | `McpTransport` protocol + Streamable HTTP transport on httpx (JSON or SSE responses, `Mcp-Session-Id`, bearer auth, no redirects, response size cap) |
+| `app/integrations/http/webhook.py` | Webhook HTTP client for Teams (timeouts, no redirects, payload size cap, status → error classification) |
+| `app/integrations/destinations.py` | Approved-destination policy (alias → server-side target) |
+| `app/integrations/secrets.py` | Registry of configured secret values, scrubbed from every log record and every telemetry payload |
+| `app/agents/execution/tools/integrations.py` | `NotionMcpAdapter`, `GoogleDriveMcpAdapter`, `TeamsWebhookAdapter` (same `ToolAdapter` contract as the mocks) and `build_integration_registry` |
+| `app/api/integrations.py` | `GET /api/v1/integrations/status` |
+
+### Reliability semantics
+
+- **Errors** are classified as `TRANSIENT` (retried), `PERMANENT` or `PERMISSION`, and record whether the request may have reached the server. Error messages are fixed strings and never include remote response text, which can echo arguments.
+- **No duplicate writes:** a transient failure *after* a write request was sent (read timeout, 5xx) becomes the permanent `OUTCOME_UNKNOWN` and is **not retried**, so a Teams message or Notion page cannot be created twice. Failures before sending (connection refused, 429) are retried as usual.
+- **Idempotency:** each adapter records results per `workflow_id:step-N` and replays them on retry or duplicate delivery. Request-level replay (same `workflow_id`) works as before.
+- **Saga compensation:** Notion pages are archived and Drive documents trashed through allowlisted MCP tools. Compensation is idempotent and retried on transient errors. Teams messages remain `NOT_COMPENSATABLE`.
+
+### What never leaves the server
+
+MCP URLs, bearer tokens, the operator token, webhook URLs and destination ids never appear in API responses, SSE events, Langfuse payloads or logs. Read document contents are reduced to `content_length`. This is enforced by construction and backed by the secret registry, which also scrubs httpx's own `HTTP Request: POST <url>` log line. Tests assert it for responses, SSE events, telemetry and captured logs.
+
+### Try dry-run mode (no network)
+
+```powershell
+cd C:\Projects\workflowweaver\backend
+$env:INTEGRATION_MODE = "dry_run"
+$env:NOTION_DESTINATIONS = '{"engineering": "synthetic-page-id"}'
+$env:NOTION_DEFAULT_PAGE_PARENT = "engineering"
+.\.venv\Scripts\python.exe -m uvicorn app.main:app --host 127.0.0.1 --port 8000
+# Then: GET /api/v1/integrations/status, and POST /api/v1/workflows/execute with
+# "approval": {"approved": true, "mode": "dry_run", "approved_by": "synthetic.reviewer"}
+```
+
+The UI always sends `mode: "mock"`, so with the server in `dry_run` or `real` the UI's executions are rejected with 409. Use the API directly for those modes in 5.1.
+
+### Stage 5.1 limitations
+
+- No real server has been contacted. Notion tool names and argument shapes follow the open-source Notion MCP server's API-style tools, and the Google Drive tool names are placeholders. Both must be verified against the servers chosen in 5.2 (`tools/list`).
+- The idempotency ledger and execution results are in memory and per process. A restart loses them, so a real write cannot be reconciled after a crash. Durable storage is required before production use.
+- Notion `create_task` sets only the title property; assignee and due date go into the page body (database property names are workspace-specific).
+- Teams webhooks return no message id; a stable synthetic id is derived from the idempotency key.
+- The operator token is a single shared secret, not per-user authentication. SSE streaming remains disabled when `APP_ENV=production`.
+
 ## Safety guarantees
 
 - `/plan` never executes anything; every planning response has `executed: false`. Execution is a separate, explicitly approved call to `/execute` or `/executions`, and the plan is re-validated before anything runs.
-- Execution uses **in-memory mock adapters only**: no network, MCP server or webhook is contacted, and Notion/Drive/Teams credentials are not read.
+- By default (`INTEGRATION_MODE=mock`) execution uses **in-memory mock adapters only**: no network, MCP server or webhook is contacted. `dry_run` opens no connection either. `real` needs explicit server configuration, `REAL_WRITES_ENABLED=true`, an operator token per request and approved destinations before any write.
 - SSE streams require a per-workflow capability token (mock-only access model, disabled when `APP_ENV=production`). The token is redacted from access and request logs.
 - No secrets reach the browser bundle, SSE events or Langfuse.
 - LLM output is untrusted: it is parsed into a Pydantic schema, then checked against an allow-list of integrations, actions and arguments.
@@ -456,4 +542,4 @@ Latency is recorded on every observation (span timing plus `latency_ms` metadata
 
 ## Known limitations
 
-Mock integrations only, in-memory single-process state (no persistence, no multi-worker SSE), capability-token access model rather than user authentication, sequential step execution, and no failure-demo mode in the UI. The complete list and Phase 5 recommendations are in [docs/ARCHITECTURE.md §17-18](docs/ARCHITECTURE.md#17-known-limitations).
+Real integrations exist only as a foundation tested against fakes (see [Stage 5.1 limitations](#stage-51-limitations)), in-memory single-process state (no persistence, no multi-worker SSE), capability-token access model rather than user authentication, sequential step execution, and no failure-demo mode in the UI. The complete list and Phase 5 recommendations are in [docs/ARCHITECTURE.md §17-18](docs/ARCHITECTURE.md#17-known-limitations).

@@ -454,9 +454,19 @@ def test_second_start_while_running_is_409(api):
 def test_invalid_body_is_422_and_nothing_starts(api):
     client, runner = api()
     payload = body()
-    payload["approval"]["mode"] = "real"
+    payload["approval"]["mode"] = "production"  # not a mode at all
     assert client.post(START_URL, json=payload).status_code == 422
     assert len(runner.broker) == 0
+
+
+@pytest.mark.parametrize("mode", ["real", "dry_run"])
+def test_mode_mismatch_is_409_and_nothing_starts(api, mode):
+    client, runner = api()
+    payload = body()
+    payload["approval"]["mode"] = mode  # the server runs in mock mode
+    assert client.post(START_URL, json=payload).status_code == 409
+    assert len(runner.broker) == 0
+    assert runner.service.registry.store.calls == []
 
 
 @pytest.mark.parametrize("settings", [Settings(_env_file=None, mock_execution_enabled=False),

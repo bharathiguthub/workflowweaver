@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 from app.agents.planners import PlannerConfigError, create_planner
 from app.agents.service import PlanningService
 from app.agents.synthetic_documents import SYNTHETIC_DRIVE_DOCUMENTS
-from app.core.config import get_settings
+from app.core.config import get_settings, mock_documents_apply
 from app.schemas.plan import PlanRequest, PlanResponse, PlanStatus
 
 router = APIRouter(prefix="/api/v1/workflows", tags=["planning"])
@@ -36,7 +36,8 @@ def _default_service() -> PlanningService:
         max_steps=settings.max_workflow_steps,
         max_planning_attempts=settings.max_planning_attempts,
         # Mock execution reads only synthetic documents, so plans are checked against them.
-        available_documents=frozenset(SYNTHETIC_DRIVE_DOCUMENTS) if settings.mock_execution_enabled else None,
+        # Dry-run/real modes cannot know the document catalog offline: no check.
+        available_documents=frozenset(SYNTHETIC_DRIVE_DOCUMENTS) if mock_documents_apply(settings) else None,
     )
 
 

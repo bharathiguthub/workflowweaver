@@ -7,7 +7,8 @@ Request idempotency: ``workflow_id`` is the idempotency key.
   * Concurrent duplicates are serialised by a per-key lock; the second caller gets the replay.
   * REJECTED outcomes are not stored, so a corrected request can be resubmitted.
 
-The store is in-memory (per process, lost on restart) - adequate for mock execution only.
+The store is in-memory (per process, lost on restart). Durable persistence is required before
+real mode is used beyond controlled testing (Phase 5 later stage).
 """
 
 import hashlib
@@ -23,7 +24,7 @@ from app.agents.execution.graph import (
 from app.agents.execution.nodes import Sleeper
 from app.agents.execution.retry import RetryPolicy
 from app.agents.execution.state import ExecutionState
-from app.agents.execution.tools.registry import MockToolRegistry
+from app.agents.execution.tools.registry import ToolRegistry
 from app.observability import get_telemetry
 from app.schemas.execution import (
     CompensationResult,
@@ -40,10 +41,14 @@ class IdempotencyConflict(Exception):
     """workflow_id was already used for a different plan."""
 
 
+class ModeMismatch(Exception):
+    """approval.mode differs from the server's integration mode."""
+
+
 class ExecutionService:
     def __init__(
         self,
-        registry: MockToolRegistry,
+        registry: ToolRegistry,
         policy: RetryPolicy,
         *,
         max_steps: int,
@@ -72,11 +77,15 @@ class ExecutionService:
     def check_conflict(self, request: ExecutionRequest) -> None:
         """Raise IdempotencyConflict now if workflow_id already finished with another plan.
         (execute() re-checks under the per-key lock; this is the fast pre-check for async starts.)"""
+        if request.approval.mode != self.registry.mode.value:
+            raise ModeMismatch(f"This server executes in '{self.registry.mode.value}' mode; approval.mode must match.")
         stored = self._results.get(str(request.workflow_id))
         if stored is not None and stored[0] != plan_fingerprint(request):
             raise IdempotencyConflict(f"workflow_id {request.workflow_id} was already executed with a different plan.")
 
-    def execute(self, request: ExecutionRequest) -> ExecutionResponse:
+    def execute(self, request: ExecutionRequest, *, write_authorized: bool = False) -> ExecutionResponse:
+        """``write_authorized`` must come from a server-side check (the API verifies the
+        operator token); it is never read from the request body."""
         key = str(request.workflow_id)
         fingerprint = plan_fingerprint(request)
         telemetry = get_telemetry()
@@ -94,6 +103,8 @@ class ExecutionService:
                 ],
                 "approved": request.approval.approved,
                 "mode": request.approval.mode,
+                "server_mode": self.registry.mode.value,
+                "write_authorized": write_authorized,
             },
             metadata={"plan_fingerprint": fingerprint[:16], "max_attempts": self.policy.max_attempts},
         ) as observation:
@@ -108,7 +119,7 @@ class ExecutionService:
                     observation.update(output=outcome_summary(replay), metadata={"replayed": True})
                     return replay
 
-                state = self.run(request)
+                state = self.run(request, write_authorized=write_authorized)
                 response = to_response(state)
                 if response.status is not ExecutionStatus.REJECTED:
                     self._results[key] = (fingerprint, response)
@@ -120,7 +131,7 @@ class ExecutionService:
             telemetry.event("execution.outcome", workflow_id=key, metadata=summary, level=level)
             return response
 
-    def run(self, request: ExecutionRequest) -> ExecutionState:
+    def run(self, request: ExecutionRequest, *, write_authorized: bool = False) -> ExecutionState:
         state = initial_execution_state(
             workflow_id=str(request.workflow_id),
             raw_plan=request.plan.model_dump(mode="json"),
@@ -128,6 +139,9 @@ class ExecutionService:
             approved_by=request.approval.approved_by,
             max_steps=self.max_steps,
             max_attempts=self.policy.max_attempts,
+            mode=self.registry.mode.value,
+            requested_mode=request.approval.mode,
+            write_authorized=write_authorized,
         )
         limit = execution_recursion_limit(len(request.plan.steps), self.policy.max_attempts)
         return self.graph.invoke(state, config={"recursion_limit": limit})
@@ -163,6 +177,7 @@ def to_response(state: ExecutionState) -> ExecutionResponse:
     return ExecutionResponse(
         workflow_id=state["workflow_id"],
         status=ExecutionStatus(state["final_status"]),
+        mode=state.get("mode", "mock"),
         validation=ValidationResult(is_valid=not issues, issues=issues),
         step_results=[StepResult.model_validate(r) for r in state["step_results"]],
         attempts=state["attempts"],

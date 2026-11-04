@@ -30,6 +30,9 @@ class ExecutionState(TypedDict):
     approved: bool
     approved_by: str
     raw_plan: dict[str, Any]  # ExecutionPlanIn.model_dump()
+    mode: str  # server integration mode (IntegrationMode value); never chosen by the client
+    requested_mode: str  # approval.mode from the request; must equal ``mode``
+    write_authorized: bool  # server-verified operator authorization for real writes
 
     # validated plan
     steps: list[dict[str, Any]]  # WorkflowStep.model_dump(mode="json")

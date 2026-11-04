@@ -91,10 +91,13 @@ export interface ExecutionStepIn {
   depends_on: number[];
 }
 
+/** Server-controlled integration mode (backend INTEGRATION_MODE). The UI drives mock only. */
+export type ExecutionMode = "mock" | "dry_run" | "real";
+
 export interface ExecutionRequest {
   workflow_id: string;
   plan: { summary: string; steps: ExecutionStepIn[] };
-  approval: { approved: boolean; mode: "mock"; approved_by: string };
+  approval: { approved: boolean; mode: ExecutionMode; approved_by: string };
 }
 
 export interface ExecutionError {
@@ -130,7 +133,7 @@ export interface CompensationResult {
 export interface ExecutionResponse {
   workflow_id: string;
   status: ExecutionStatus;
-  mode: "mock";
+  mode: ExecutionMode;
   validation: ValidationResult;
   step_results: StepResult[];
   attempts: Record<string, number>;
@@ -146,7 +149,7 @@ export interface ExecutionResponse {
 export interface ExecutionStartResponse {
   workflow_id: string;
   status: "ACCEPTED";
-  mode: "mock";
+  mode: ExecutionMode;
   stream_url: string;
   stream_token: string;
   result_url: string;

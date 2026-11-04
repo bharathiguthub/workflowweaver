@@ -21,8 +21,9 @@ from app.agents.execution.tools.base import (
     ToolError,
     ToolResult,
 )
-from app.agents.execution.tools.registry import MockToolRegistry
+from app.agents.execution.tools.registry import ToolRegistry
 from app.agents.validation import document_availability_issues, validate_draft
+from app.core.config import IntegrationMode
 from app.observability import get_telemetry
 from app.schemas.events import ExecutionEventType as Ev
 from app.streaming.emitter import emit
@@ -51,7 +52,7 @@ def _error(exc: ToolError, step_number: int | None, attempt: int | None) -> dict
 class ExecutionNodes:
     def __init__(
         self,
-        registry: MockToolRegistry,
+        registry: ToolRegistry,
         policy: RetryPolicy,
         sleeper: Sleeper,
         rng: random.Random | None = None,
@@ -66,9 +67,16 @@ class ExecutionNodes:
     # ---------- prepare ----------
 
     def prepare_node(self, state: ExecutionState) -> dict[str, Any]:
-        """Re-validation + approval gate. Execution never trusts a client-supplied plan.
+        """Re-validation + approval + authorization gate. Execution never trusts a
+        client-supplied plan.
 
-        Validation runs first (it is pure) so a rejected response always reports issues."""
+        Order (all pure, no network): plan validation, executor support, document precheck
+        (mock only), approved destinations (dry-run/real) -> INVALID_PLAN; then approval ->
+        APPROVAL_REQUIRED; then the requested mode must equal the server mode ->
+        MODE_MISMATCH; then, in real mode, plans with side effects need the server-wide
+        switch (REAL_WRITES_DISABLED) and a server-verified operator authorization
+        (REAL_WRITE_AUTHORIZATION_REQUIRED). Validation runs first so a rejected response
+        always reports issues."""
         update: dict[str, Any] = {"current_step": "prepare"}
         raw = state["raw_plan"]
         draft = DraftPlan(
@@ -91,15 +99,18 @@ class ExecutionNodes:
             issues = [
                 ValidationIssue(
                     code="UNSUPPORTED_BY_EXECUTOR",
-                    message=f"No mock adapter for {s.integration.value}.{s.action.value}.",
+                    message=f"No {self._registry.mode.value} adapter for {s.integration.value}.{s.action.value}.",
                     step_number=s.step_number,
                 )
                 for s in plan.steps
                 if (s.integration, s.action) not in supported
             ]
-            if self._document_precheck:
+            catalog = self._registry.document_catalog()
+            if self._document_precheck and catalog is not None:
                 # Reject before any side effect if a read targets a missing document.
-                issues += document_availability_issues(plan, self._registry.document_catalog())
+                issues += document_availability_issues(plan, catalog)
+            supported_steps = [s for s in plan.steps if (s.integration, s.action) in supported]
+            issues += self._registry.preflight_issues(supported_steps)
         if plan is None or issues:
             logger.info("node=prepare workflow_id=%s rejected=invalid_plan issues=%d", state["workflow_id"], len(issues))
             return {
@@ -119,9 +130,15 @@ class ExecutionNodes:
                     ExecutionError(code="APPROVAL_REQUIRED", message="approval.approved must be true.").model_dump()
                 ],
             }
+        rejection = self._authorization_problem(state, plan.steps)
+        if rejection is not None:
+            code, message = rejection
+            logger.info("node=prepare workflow_id=%s rejected=%s", state["workflow_id"], code)
+            return {**update, "status": "rejected", "errors": [ExecutionError(code=code, message=message).model_dump()]}
         steps = [s.model_dump(mode="json") for s in plan.steps]
         emit(
             Ev.WORKFLOW_STARTED,
+            mode=self._registry.mode.value,
             step_count=len(steps),
             max_attempts=self._policy.max_attempts,
             steps=[
@@ -131,6 +148,24 @@ class ExecutionNodes:
             ],
         )
         return {**update, "status": "running", "steps": steps}
+
+    def _authorization_problem(self, state: ExecutionState, plan_steps) -> tuple[str, str] | None:
+        mode = self._registry.mode
+        if state["requested_mode"] != mode.value:
+            return "MODE_MISMATCH", f"This server executes in '{mode.value}' mode; approval.mode must match."
+        if mode is not IntegrationMode.REAL:
+            return None
+        writes = [s for s in plan_steps if self._registry.effect_of(s.integration, s.action) is not Effect.READ_ONLY]
+        if not writes:
+            return None
+        if not self._registry.real_writes_enabled:
+            return "REAL_WRITES_DISABLED", "Real writes are disabled on this server (REAL_WRITES_ENABLED=false)."
+        if not state["write_authorized"]:
+            return (
+                "REAL_WRITE_AUTHORIZATION_REQUIRED",
+                "Real writes need a valid X-Integration-Authorization header.",
+            )
+        return None
 
     # ---------- execute ----------
 
@@ -148,6 +183,7 @@ class ExecutionNodes:
             action=action,
             arguments=dict(step["arguments"]),
             attempt=attempt,
+            write_authorized=state["write_authorized"],
         )
         effect = self._registry.effect_of(integration, action)
         emit(Ev.STEP_STARTED, step_number=n, attempt=attempt, integration=integration.value, action=action.value)
@@ -159,7 +195,7 @@ class ExecutionNodes:
             step_number=n,
             # Argument NAMES only; values may contain user content.
             input={"argument_names": sorted(call.arguments)},
-            metadata={"attempt": attempt, "effect": effect.value, "mode": "mock"},
+            metadata={"attempt": attempt, "effect": effect.value, "mode": self._registry.mode.value},
         ) as observation:
             result, error = self._call_tool(call, effect)
             if error is None:
@@ -376,7 +412,8 @@ class ExecutionNodes:
                 workflow_id=workflow_id,
                 step_number=entry["step_number"],
                 input={"resource_id": entry["resource_id"]},
-                metadata={"attempt": attempt, "reconciled": entry.get("reconciled", False), "mode": "mock"},
+                metadata={"attempt": attempt, "reconciled": entry.get("reconciled", False),
+                          "mode": self._registry.mode.value},
             ) as observation:
                 undone, error = self._call_compensation(call, workflow_id)
                 if error is None:
@@ -451,7 +488,10 @@ class ExecutionNodes:
             error_codes=[e.get("code") for e in state["errors"]],
             validation_issue_codes=[i.get("code") for i in state["validation_issues"]],
         )
-        return {"current_step": "finalize", "status": "finished", "final_status": status.value, "message": _MESSAGES[status]}
+        message = _MESSAGES[status]
+        if status is ExecutionStatus.COMPLETED:
+            message = _COMPLETED_MESSAGES.get(state["mode"], message)
+        return {"current_step": "finalize", "status": "finished", "final_status": status.value, "message": message}
 
 
 def _journal_entry(step: dict[str, Any], result: ToolResult, effect: Effect, *, reconciled: bool = False) -> dict[str, Any]:
@@ -491,6 +531,12 @@ _MESSAGES = {
         "A step failed and at least one compensation also failed; manual review required."
     ),
     ExecutionStatus.REJECTED: "Request rejected before execution; nothing was executed.",
+}
+
+_COMPLETED_MESSAGES = {
+    IntegrationMode.MOCK.value: _MESSAGES[ExecutionStatus.COMPLETED],
+    IntegrationMode.DRY_RUN.value: "All steps validated (dry run; no request was sent to any service).",
+    IntegrationMode.REAL.value: "All steps completed against the configured services.",
 }
 
 

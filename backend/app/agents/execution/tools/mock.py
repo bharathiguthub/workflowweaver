@@ -42,7 +42,8 @@ class MockToolStore:
         return {rid: r for rid, r in self.resources.items() if not r["deleted"]}
 
 
-def _check_arguments(call: ToolCall) -> None:
+def check_arguments(call: ToolCall) -> None:
+    """Catalog argument check shared by every adapter (mock, dry-run, real)."""
     spec = ACTION_CATALOG[call.integration][call.action]
     unknown = set(call.arguments) - spec.allowed
     missing = {name for name in spec.required if not call.arguments.get(name, "").strip()}
@@ -68,7 +69,7 @@ class _MockAdapter:
         self.store.calls.append(("execute", call.idempotency_key, call.step_number))
         if call.action not in self.effects:
             raise ToolError(ErrorKind.PERMANENT, "UNSUPPORTED_ACTION", f"{call.action.value} not supported")
-        _check_arguments(call)
+        check_arguments(call)
 
         previous = self.store.completed.get(call.idempotency_key)
         if previous is not None:  # duplicate delivery / retry after a lost response

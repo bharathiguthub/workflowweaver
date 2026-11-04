@@ -9,7 +9,7 @@ from app.agents.execution.tools.base import (
 )
 from app.agents.execution.tools.faults import FailureInjector, Fault
 from app.agents.execution.tools.mock import DRIVE_FIXTURES, MockToolStore
-from app.agents.execution.tools.registry import MockToolRegistry, create_tool_registry
+from app.agents.execution.tools.registry import MockToolRegistry, ToolRegistry, create_tool_registry
 
 __all__ = [
     "DRIVE_FIXTURES",
@@ -23,6 +23,7 @@ __all__ = [
     "ToolAdapter",
     "ToolCall",
     "ToolError",
+    "ToolRegistry",
     "ToolResult",
     "create_tool_registry",
 ]

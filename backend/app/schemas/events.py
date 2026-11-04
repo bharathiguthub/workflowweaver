@@ -53,7 +53,7 @@ class ExecutionEvent(BaseModel):
 class ExecutionStartResponse(BaseModel):
     workflow_id: UUID
     status: Literal["ACCEPTED"] = "ACCEPTED"
-    mode: Literal["mock"] = "mock"
+    mode: Literal["mock", "dry_run", "real"] = "mock"
     stream_url: str = Field(description="SSE stream for this workflow (relative URL, token included)")
     stream_token: str = Field(description="Capability token for this workflow's stream only. Mock-only access model.")
     result_url: str = Field(description="Final ExecutionResponse once the run finishes")
