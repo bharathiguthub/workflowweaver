@@ -192,8 +192,23 @@ def _no_real_integrations(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _no_real_anthropic_key(monkeypatch):
-    # Guarantee no test can authenticate against the real API, even if the developer's
-    # shell has a key set.
-    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+def _no_real_llm_key(monkeypatch):
+    """No test can authenticate against a real LLM API, even if the developer's shell or
+    .env has a key. Keys are set to "" rather than deleted: Settings reads ANTHROPIC_API_KEY
+    and GEMINI_API_KEY from .env too, and an environment variable always wins over .env.
+    PLANNER_MODE is pinned to mock (tests that need another mode set it themselves), and the
+    settings cached at app import time (read before any fixture ran) are discarded."""
+    from app.api import planning as planning_api
+    from app.core.config import get_settings
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "")
     monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    monkeypatch.setenv("GEMINI_API_KEY", "")
+    monkeypatch.setenv("GROQ_API_KEY", "")
+    monkeypatch.delenv("GOOGLE_API_KEY", raising=False)  # also read by the google-genai SDK
+    monkeypatch.setenv("PLANNER_MODE", "mock")
+    get_settings.cache_clear()
+    planning_api._default_service.cache_clear()
+    yield
+    get_settings.cache_clear()
+    planning_api._default_service.cache_clear()

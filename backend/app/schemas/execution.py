@@ -18,7 +18,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from app.schemas.plan import ValidationResult
+from app.schemas.plan import IntegrationTarget, ValidationResult
 
 
 ExecutionMode = Literal["mock", "dry_run", "real"]
@@ -31,6 +31,9 @@ class ExecutionStatus(str, Enum):
     PARTIALLY_ROLLED_BACK = "PARTIALLY_ROLLED_BACK"
     COMPENSATION_FAILED = "COMPENSATION_FAILED"
     REJECTED = "REJECTED"
+    # Phase 7.2 (Drive + Notion + Teams only): every Notion page was created and verified and is
+    # kept; only the final, non-compensatable Teams notification failed (or its outcome is unknown).
+    PARTIALLY_COMPLETED = "PARTIALLY_COMPLETED"
 
 
 class StepStatus(str, Enum):
@@ -60,6 +63,17 @@ class ExecutionApproval(BaseModel):
         "approved; it never selects or changes the mode."
     )
     approved_by: str = Field(min_length=3, max_length=80, examples=["synthetic.reviewer"])
+    integration_target: IntegrationTarget | None = Field(
+        default=None,
+        description="The integration target the approver reviewed. Must equal the plan's target "
+        "(INTEGRATION_TARGET_MISMATCH otherwise).",
+    )
+    plan_digest: str | None = Field(
+        default=None, pattern=r"^[0-9a-f]{64}$",
+        description="SHA-256 of the reviewed plan (plan_digest from the planning response). Required for "
+        "plans whose digest the server recorded; must equal it and the digest of the submitted plan "
+        "(APPROVAL_PLAN_MISMATCH otherwise).",
+    )
 
 
 class ExecutionStepIn(BaseModel):
@@ -78,6 +92,8 @@ class ExecutionPlanIn(BaseModel):
 
     summary: str = Field(default="", max_length=1000)
     steps: list[ExecutionStepIn] = Field(max_length=50)
+    integration_target: IntegrationTarget | None = Field(
+        default=None, description="Target the plan was generated for (from the planning response).")
 
 
 class ExecutionRequest(BaseModel):

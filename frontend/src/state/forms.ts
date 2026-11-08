@@ -1,4 +1,4 @@
-import type { ExecutionRequest, PlanRequest, PlanResponse } from "../api/types";
+import type { ExecutionMode, ExecutionRequest, IntegrationTarget, PlanRequest, PlanResponse } from "../api/types";
 
 // Limits mirror the backend Pydantic models (PlanRequest, ExecutionApproval).
 export const INSTRUCTION_MIN = 10;
@@ -31,14 +31,34 @@ export function validateApprover(value: string): string | null {
   return null;
 }
 
-export function toPlanRequest(instruction: string, name: string): PlanRequest {
-  const trimmedName = name.trim();
-  return trimmedName ? { instruction: instruction.trim(), name: trimmedName } : { instruction: instruction.trim() };
+/** Typed exactly by the approver before a real Notion page can be created. */
+export const REAL_CONFIRMATION_PHRASE = "CREATE NOTION PAGE";
+/** Typed before a real Google Drive upload (Phase 6.1). */
+/** Typed to approve a REAL Teams post (Phase 7.1). Messages cannot be unsent. */
+export const TEAMS_CONFIRMATION_PHRASE = "SEND TEAMS MESSAGE";
+
+export const DRIVE_CONFIRMATION_PHRASE = "UPLOAD TO DRIVE";
+
+export function validateRealConfirmation(value: string, phrase: string = REAL_CONFIRMATION_PHRASE): string | null {
+  return value.trim() === phrase ? null : `Type ${phrase} exactly.`;
 }
 
-/** The validated plan exactly as returned by /plan, plus explicit mock approval. */
-export function toExecutionRequest(plan: PlanResponse, approvedBy: string): ExecutionRequest {
-  return {
+export function toPlanRequest(
+  instruction: string,
+  name: string,
+  mode: ExecutionMode = "mock",
+  target?: IntegrationTarget,
+): PlanRequest {
+  const trimmedName = name.trim();
+  const base: PlanRequest = trimmedName
+    ? { instruction: instruction.trim(), name: trimmedName, mode }
+    : { instruction: instruction.trim(), mode };
+  return target ? { ...base, target } : base;
+}
+
+/** The validated plan exactly as returned by the server, plus explicit approval for ``mode``. */
+export function toExecutionRequest(plan: PlanResponse, approvedBy: string, mode: ExecutionMode = "mock"): ExecutionRequest {
+  const request: ExecutionRequest = {
     workflow_id: plan.workflow_id,
     plan: {
       summary: plan.summary ?? "",
@@ -51,6 +71,14 @@ export function toExecutionRequest(plan: PlanResponse, approvedBy: string): Exec
         depends_on: [...s.depends_on],
       })),
     },
-    approval: { approved: true, mode: "mock", approved_by: approvedBy.trim() },
+    approval: { approved: true, mode, approved_by: approvedBy.trim() },
   };
+  // The server rejects the run unless the approved target equals the plan's target.
+  const target = plan.integration_target;
+  const bound = target
+    ? { ...request, plan: { ...request.plan, integration_target: target }, approval: { ...request.approval, integration_target: target } }
+    : request;
+  // Phase 7.2: the approval names the exact reviewed plan (server-recorded digest).
+  const digest = (plan as { plan_digest?: unknown }).plan_digest;
+  return typeof digest === "string" && digest ? { ...bound, approval: { ...bound.approval, plan_digest: digest } } : bound;
 }

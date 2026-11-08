@@ -108,7 +108,24 @@ class ToolRegistry:
             return adapter.execute(call).model_copy(update={"resource_id": None})
         if fault is not None:
             _raise(fault)
-        return adapter.execute(call)
+        return self._verified(adapter, call, adapter.execute(call))
+
+    def _verified(self, adapter, call: ToolCall, result: ToolResult) -> ToolResult:
+        """Phase 7.2: when the run asks for it (call.verify_after), read a created resource back
+        with the adapter's own read-only check. 'failed' fails the step permanently; the executor
+        then journals the created resource (it is in the ledger) and compensates it."""
+        verify = getattr(adapter, "verify", None)
+        if (not call.verify_after or verify is None or not result.resource_id
+                or adapter.effect_of(call.action) is Effect.READ_ONLY):
+            return result
+        if result.output.get("verification") == "verified":
+            return result  # replayed result already verified in this run
+        status = verify(call, result)
+        result.output["verification"] = status
+        if status == "failed":
+            raise ToolError(ErrorKind.PERMANENT, "VERIFICATION_FAILED",
+                            "The created resource could not be read back as expected.")
+        return result
 
     def find_result(self, call: ToolCall) -> ToolResult | None:
         adapter = self.adapters.get(call.integration)

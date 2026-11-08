@@ -26,6 +26,9 @@ export default defineConfig(({ mode }) => {
       setupFiles: ["./src/test/setup.ts"],
       css: false,
       restoreMocks: true,
+      // The App integration tests drive whole workflows with user-event (typing, approvals,
+      // streams); each takes 1.5-3.5 s alone and longer when 15 files run in parallel.
+      testTimeout: 20_000,
     },
   };
 });

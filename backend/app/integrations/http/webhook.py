@@ -1,4 +1,10 @@
-"""HTTP client abstraction for outgoing webhooks (Microsoft Teams incoming webhooks).
+"""HTTP client abstraction for outgoing webhooks (Microsoft Teams Workflows webhooks).
+
+Microsoft documents a limit of four requests per second per webhook ("the client
+connection is throttled"), so posts to the same URL are spaced at least
+``MIN_INTERVAL_SECONDS`` apart client-side. Any 2xx is accepted: Microsoft does not
+document whether success is 200 or 202, nor whether 2xx means "posted" or only "workflow
+triggered".
 
 The webhook URL is a credential: it is passed per call from server configuration, never
 logged (httpx's own request log line is scrubbed by the secret registry), never included
@@ -16,6 +22,9 @@ Error classification (``request_sent`` = the message may have been delivered):
 """
 
 import json
+import threading
+import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -24,7 +33,8 @@ import httpx
 from app.agents.execution.tools.base import ErrorKind
 from app.integrations.errors import IntegrationError
 
-MAX_PAYLOAD_BYTES = 28 * 1024  # Teams rejects larger messages
+MAX_PAYLOAD_BYTES = 28 * 1024  # documented Teams message size limit
+MIN_INTERVAL_SECONDS = 0.25  # documented: more than four requests per second are throttled
 
 
 @dataclass(frozen=True)
@@ -44,7 +54,12 @@ def _err(kind: ErrorKind, code: str, message: str, *, sent: bool) -> Integration
 
 class WebhookClient:
     def __init__(self, *, connect_timeout: float, timeout: float,
-                 http_transport: httpx.BaseTransport | None = None) -> None:
+                 http_transport: httpx.BaseTransport | None = None,
+                 clock: Callable[[], float] = time.monotonic, sleeper: Callable[[float], None] = time.sleep,
+                 min_interval: float = MIN_INTERVAL_SECONDS) -> None:
+        self._clock, self._sleep, self._min_interval = clock, sleeper, min_interval
+        self._last_post: dict[str, float] = {}
+        self._throttle_lock = threading.Lock()
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout, connect=connect_timeout),
             follow_redirects=False,
@@ -60,6 +75,7 @@ class WebhookClient:
         if len(body) > MAX_PAYLOAD_BYTES:
             raise _err(ErrorKind.PERMANENT, "WEBHOOK_PAYLOAD_TOO_LARGE", "Message is too large for the webhook.",
                        sent=False)
+        self._throttle(url)
         try:
             response = self._client.post(url, content=body)
         except (httpx.ConnectError, httpx.ConnectTimeout, httpx.PoolTimeout) as exc:
@@ -82,6 +98,15 @@ class WebhookClient:
         if code in (404, 410):
             raise _err(ErrorKind.PERMANENT, "WEBHOOK_NOT_FOUND", "Webhook no longer exists.", sent=True)
         raise _err(ErrorKind.PERMANENT, "WEBHOOK_REJECTED", f"Webhook rejected the request (HTTP {code}).", sent=True)
+
+    def _throttle(self, url: str) -> None:
+        with self._throttle_lock:
+            last = self._last_post.get(url)
+            now = self._clock()
+            if last is not None and now - last < self._min_interval:
+                self._sleep(self._min_interval - (now - last))
+                now = self._clock()
+            self._last_post[url] = now
 
     def close(self) -> None:
         self._client.close()

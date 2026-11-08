@@ -1,16 +1,15 @@
 """Application settings loaded from environment variables (and an optional .env file).
 
-Secrets such as ANTHROPIC_API_KEY are deliberately NOT modelled here: the Anthropic SDK
-reads them from the environment itself, so they never pass through our code or logs.
-The Langfuse secret key is the exception (it must be read from .env too); it is a
-SecretStr, so it is masked in repr()/logs and only unwrapped when the client is built.
+Secrets (ANTHROPIC_API_KEY, the Langfuse secret key, integration tokens) are SecretStr:
+masked in repr()/logs and only unwrapped where a client is built. ANTHROPIC_API_KEY may come
+from the shell or from .env; when neither sets it the SDK's own environment lookup applies.
 """
 
 from enum import Enum
 from functools import lru_cache
 from pathlib import Path
 
-from pydantic import Field, SecretStr
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 # C:\Projects\workflowweaver\.env (repo root), next to .env.example
@@ -20,10 +19,25 @@ ENV_FILE = Path(__file__).resolve().parents[3] / ".env"
 class PlannerMode(str, Enum):
     MOCK = "mock"
     CLAUDE = "claude"
+    GEMINI = "gemini"
+    # Primary planner with automatic fallback (PRIMARY_PLANNER -> FALLBACK_PLANNER, default
+    # Groq -> Gemini) on provider outages only: rate limits (429), provider failures
+    # (500/502/503, plus 408/504), connection errors and timeouts.
+    AUTO = "auto"
+
+
+class PlannerProvider(str, Enum):
+    """AI planner providers usable as PRIMARY_PLANNER / FALLBACK_PLANNER in auto mode."""
+
+    CLAUDE = "claude"
+    GEMINI = "gemini"
+    GROQ = "groq"
 
 
 class IntegrationMode(str, Enum):
-    """Server-controlled; a client can never select or escalate the mode.
+    """Server-controlled CEILING: a request may select this mode or a lower one
+    (mock < dry_run < real) with approval.mode, never a higher one. Lower modes make no
+    network call and no side effect, so downgrading cannot weaken any real-mode gate.
 
     mock    in-memory adapters, synthetic data, no network (default)
     dry_run the real adapters validate arguments, destinations and authorization and build
@@ -36,6 +50,19 @@ class IntegrationMode(str, Enum):
     REAL = "real"
 
 
+class DriveTransport(str, Enum):
+    """How the real Google Drive adapter talks to Drive.
+
+    mcp   the official drivemcp.googleapis.com server (Phase 5.2, documented contract only;
+          no trash/folder tools, so uploads cannot be rolled back)
+    rest  Drive REST API v3 with OAuth 2.0 (Desktop app, PKCE) and ONLY the drive.file
+          scope (Phase 6.1): folders, uploads, verification, listing and trash rollback
+    """
+
+    MCP = "mcp"
+    REST = "rest"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=ENV_FILE, env_file_encoding="utf-8", extra="ignore")
 
@@ -43,13 +70,59 @@ class Settings(BaseSettings):
     log_level: str = "INFO"
 
     planner_mode: PlannerMode = PlannerMode.MOCK
+    # Read from the shell environment OR .env and passed to the Anthropic client explicitly
+    # (pydantic-settings does not export .env values to os.environ). Never logged.
+    anthropic_api_key: SecretStr | None = None
     # No default model: the model identifier must come from configuration.
     anthropic_model: str | None = None
     anthropic_max_tokens: int = Field(default=8000, ge=256, le=64000)
+
+    # PLANNER_MODE=gemini: Google Gemini via the official google-genai SDK. Key from the
+    # shell or .env, passed to the client explicitly, redacted from logs. No default model:
+    # choose one available to your API project (see README).
+    gemini_api_key: SecretStr | None = None
+    gemini_model: str | None = None
+    # Includes Gemini "thinking" tokens, which count toward the output limit.
+    gemini_max_output_tokens: int = Field(default=16384, ge=256, le=65536)
     planner_timeout_seconds: float = Field(default=60.0, gt=0, le=600)
+
+    # PLANNER_MODE=auto: PRIMARY_PLANNER (default Groq) is tried first (with the bounded retry
+    # policy below); FALLBACK_PLANNER (default Gemini) is used only when the primary is
+    # unavailable (HTTP 429, 500/502/503, 408/504, connection errors, timeouts) - never for bad
+    # credentials, refusals or invalid plans. The same order applies to workflow planning,
+    # project plans and Phase 7.2 document extraction.
+    primary_planner: PlannerProvider = PlannerProvider.GROQ
+    fallback_planner: PlannerProvider | None = PlannerProvider.GEMINI
+
+    # Groq (official groq SDK, structured outputs with strict json_schema). Key from the
+    # shell or .env, passed to the client explicitly, redacted from logs. No default model:
+    # use one with strict structured-output support (see README / .env.example).
+    groq_api_key: SecretStr | None = None
+    groq_model: str | None = None
+    groq_max_tokens: int = Field(default=8192, ge=256, le=65536)
+
+    @field_validator("fallback_planner", mode="before")
+    @classmethod
+    def _blank_fallback_is_none(cls, value):
+        """FALLBACK_PLANNER= (empty) or 'none' disables the fallback."""
+        if isinstance(value, str) and value.strip().lower() in {"", "none", "off"}:
+            return None
+        return value
+
+    @model_validator(mode="after")
+    def _fallback_differs_from_primary(self):
+        if self.fallback_planner is not None and self.fallback_planner == self.primary_planner:
+            raise ValueError("FALLBACK_PLANNER must differ from PRIMARY_PLANNER (or be empty to disable it).")
+        return self
 
     max_workflow_steps: int = Field(default=10, ge=1, le=50)
     max_planning_attempts: int = Field(default=2, ge=1, le=5)
+    # Wait between planner attempts after a RETRYABLE planner error (429, 5xx such as Gemini
+    # 503 UNAVAILABLE, timeouts, invalid output): base * 2^(n-1), capped at max, with equal
+    # jitter (uniform in [d/2, d]). With the defaults: ~0.5-1 s, then ~1-2 s, ... up to 8 s.
+    planning_backoff_base_seconds: float = Field(default=1.0, ge=0, le=30)
+    planning_backoff_max_seconds: float = Field(default=8.0, ge=0, le=60)
+    planning_backoff_jitter: bool = True
 
     # Phase 3: mock execution engine
     mock_execution_enabled: bool = True
@@ -88,35 +161,67 @@ class Settings(BaseSettings):
     integration_connect_timeout_seconds: float = Field(default=5.0, gt=0, le=60)
     integration_timeout_seconds: float = Field(default=20.0, gt=0, le=120)
 
-    # Notion MCP server (Streamable HTTP). The bearer token authenticates US to the MCP
-    # server; the Notion API key itself lives in the MCP server's own configuration.
+    # Notion MCP server: the self-hosted @notionhq/notion-mcp-server (verified: 2.6.1) run
+    # with --transport http. The bearer token is that server's --auth-token / AUTH_TOKEN;
+    # the Notion integration token (NOTION_TOKEN) lives in the MCP server's own environment.
     notion_mcp_url: str | None = None
     notion_mcp_auth_token: SecretStr | None = None
-    # Comma-separated MCP tool names this server may call. Anything else is refused.
-    notion_mcp_tool_allowlist: str = "API-post-page,API-patch-page"
-    notion_tool_create_page: str = "API-post-page"
-    notion_tool_archive_page: str = "API-patch-page"
+    # Comma-separated subset of the verified tools (app.integrations.contracts) this server
+    # may call. Tool names are fixed by the contract; the allowlist can only narrow them.
+    notion_mcp_tool_allowlist: str = "API-post-page,API-patch-page,API-retrieve-a-page"
     # Approved destinations: JSON object alias -> Notion page/database id. Plans refer to
     # aliases only (create_page "parent" argument); ids never leave the server.
     notion_destinations: str = "{}"
     notion_default_page_parent: str | None = None  # alias used when "parent" is omitted
     notion_task_database: str | None = None  # alias of the database create_task writes to
 
-    # Google Drive MCP server (Streamable HTTP)
+    # Google Drive: the official Google-hosted Drive MCP server
+    # (https://drivemcp.googleapis.com/mcp/v1). It authenticates with an OAuth 2.0 ACCESS
+    # token (short-lived; no refresh flow yet - see README). Contract is documented-only.
     google_drive_mcp_url: str | None = None
     google_drive_mcp_auth_token: SecretStr | None = None
-    google_drive_mcp_tool_allowlist: str = "create_document,read_document,search_documents,trash_file"
-    google_drive_tool_create_document: str = "create_document"
-    google_drive_tool_search_documents: str = "search_documents"
-    google_drive_tool_read_document: str = "read_document"
-    google_drive_tool_trash_file: str = "trash_file"
+    # Remove create_file to make Drive read-only (create_document is then unsupported).
+    google_drive_mcp_tool_allowlist: str = "create_file,search_files,read_file_content,get_file_metadata"
     google_drive_destinations: str = "{}"  # JSON alias -> folder id
     google_drive_default_folder: str | None = None
+
+    # ---------- Phase 6.1: Google Drive REST API (OAuth 2.0, drive.file scope only) ----------
+    # Default "mcp" keeps the Phase 5 behaviour; set GOOGLE_DRIVE_TRANSPORT=rest to use the
+    # REST adapter. The OAuth scope is FIXED in code (drive.file) and is not configurable.
+    google_drive_transport: DriveTransport = DriveTransport.MCP
+    # OAuth client of type "Desktop app" from Google Cloud Console. The secret is redacted
+    # everywhere; Google documents Desktop-client secrets as not confidential, but we still
+    # never log or return it.
+    google_oauth_client_id: str | None = None
+    google_oauth_client_secret: SecretStr | None = None
+    # Where scripts/google_drive_auth.py stores the refresh token. Must be OUTSIDE the
+    # repository. Empty -> %LOCALAPPDATA%\WorkflowWeaver\google-drive-token.json (Windows)
+    # or ~/.config/workflowweaver/google-drive-token.json.
+    google_drive_token_file: str | None = None
+    # true (default): in dry_run/real mode, Drive writes go ONLY into SMOKE_TEST_DRIVE_FOLDER
+    # or into folders created earlier in the same run (parent_step).
+    google_drive_real_writes_sandbox_only: bool = True
 
     # Microsoft Teams incoming webhooks: JSON alias -> webhook URL. The URL *is* the
     # credential, so the whole map is a secret. Approved channels are exactly its keys.
     teams_webhook_urls: SecretStr | None = None
     teams_default_channel: str | None = None
+    # true (default): in dry_run/real mode, Teams messages go ONLY to SMOKE_TEST_TEAMS_CHANNEL
+    # (Phase 7.1 Teams Only workflow). false: any approved TEAMS_WEBHOOK_URLS alias.
+    teams_real_writes_sandbox_only: bool = True
+
+    # ---------- Phase 5.3: controlled smoke tests (scripts/smoke_integrations.py) ----------
+    # Aliases of NON-PRODUCTION sandbox destinations. Smoke-test writes go ONLY here; each must
+    # also be an approved destination alias above. Empty = smoke writes impossible.
+    smoke_test_notion_parent: str | None = None
+    smoke_test_drive_folder: str | None = None
+    smoke_test_teams_channel: str | None = None
+
+    # ---------- Phase 5.3 business workflow: Notion sandbox confinement ----------
+    # true (default): in dry_run/real mode, top-level Notion pages may be created ONLY under
+    # SMOKE_TEST_NOTION_PARENT, child pages only inside pages created by the same run, and
+    # task-database writes are refused. false: any approved NOTION_DESTINATIONS alias.
+    notion_real_writes_sandbox_only: bool = True
 
 
 DEV_FRONTEND_ORIGINS = ("http://localhost:5173", "http://127.0.0.1:5173")

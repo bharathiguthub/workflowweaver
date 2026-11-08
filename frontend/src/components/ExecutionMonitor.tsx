@@ -1,6 +1,6 @@
 import type { ConnectionState } from "../api/stream";
 import { actionLabel, integrationLabel, type ExecutionEvent } from "../api/types";
-import { isTerminalStatus, type ExecutionView } from "../state/execution";
+import { isTerminalStatus, type ExecutionView, type StepView } from "../state/execution";
 import { Alert, Badge, StepStatusBadge, WorkflowStatusBadge } from "./StatusBadge";
 
 interface Props {
@@ -25,16 +25,25 @@ export function describeEvent(event: ExecutionEvent): string {
   const where = (k1: string, k2: string) =>
     typeof m[k1] === "string" && typeof m[k2] === "string" ? ` · ${integrationLabel(m[k1] as string)} ${actionLabel(m[k2] as string).toLowerCase()}` : "";
   switch (event.event_type) {
+    case "approval_verified":
+      return `Approval verified: bound to the reviewed plan (digest ${String(m.plan_digest ?? "?")}…, ${String(m.write_count ?? "?")} write step(s))`;
     case "workflow_started":
       return `Workflow started with ${String(m.step_count ?? "?")} step(s)`;
     case "step_started":
       return `${step} started (attempt ${String(m.attempt ?? 1)})${where("integration", "action")}`;
     case "step_succeeded":
+      if (m.integration === "teams") {
+        return `${step} succeeded · Microsoft Teams message${m.replayed === true ? " (replayed, not posted again)" : ""}`;
+      }
       return `${step} succeeded${m.replayed === true ? " (replayed, no duplicate effect)" : ""}`;
     case "step_failed":
       return `${step} attempt ${String(m.attempt ?? "?")} failed: ${String(m.error_code ?? "error")}${
         m.will_retry === true ? ", will retry" : m.retries_exhausted === true ? ", retries exhausted" : ""
       }`;
+    case "resource_verified":
+      return `${step}: read-back ${
+        m.status === "verified" ? "verified" : m.status === "not_performed" ? "not performed (dry run)" : "unavailable"
+      }${where("integration", "action")}`;
     case "retry_scheduled":
       return `${step}: ${m.phase === "compensation" ? "compensation " : ""}retry ${String(m.next_attempt ?? "")} in ${String(
         m.delay_seconds ?? "?",
@@ -63,8 +72,32 @@ const EVENT_DOT: Record<string, string> = {
   compensation_completed: "bg-violet-500",
 };
 
+/** The run's mode, from the workflow_started event (the server's word, not the client's). */
+function runMode(view: ExecutionView): string | null {
+  const started = view.events.find((e) => e.event_type === "workflow_started");
+  return typeof started?.metadata.mode === "string" ? started.metadata.mode : null;
+}
+
+/** Phase 7.1: what a Teams step's status means, without claiming more than the webhook reports. */
+export function teamsStepNote(step: StepView, mode: string | null): string | null {
+  if (step.integration !== "teams") return null;
+  if (step.status === "succeeded") {
+    if (mode === "real") return "Accepted by the Teams webhook (Microsoft does not confirm the post itself).";
+    if (mode === "dry_run") return "Request built and checked; not sent (dry run).";
+    return "Delivery simulated (mock); nothing was posted.";
+  }
+  if (step.status === "retrying") return "Webhook did not receive the request; retrying (no message was posted).";
+  if (step.status === "failed" && step.lastErrorCode === "OUTCOME_UNKNOWN") {
+    return "Outcome unknown: the webhook may have received the message. Not retried, to avoid a duplicate; check the channel.";
+  }
+  if (step.status === "failed") return "Not posted.";
+  if (step.status === "not_reversible") return "A posted Teams message cannot be unsent; it remains in the channel.";
+  return null;
+}
+
 export function ExecutionMonitor({ view, connection, onReconnect, onCheckResult }: Props) {
   const finished = isTerminalStatus(view.workflowStatus);
+  const mode = runMode(view);
   const lost = connection === "failed" && !finished;
 
   return (
@@ -112,6 +145,22 @@ export function ExecutionMonitor({ view, connection, onReconnect, onCheckResult 
                 {s.step_number}. {integrationLabel(s.integration)}
               </p>
               <p className="text-xs text-slate-600">{actionLabel(s.action)}</p>
+              {s.title && <p className="mt-0.5 break-words text-xs font-medium text-slate-800">{s.title}</p>}
+              {s.resourceId && (
+                <p className="mt-0.5 break-all font-mono text-[11px] text-slate-600">
+                  {s.integration === "notion" ? "Page ID" : s.integration === "teams" ? "Message reference" : "Resource"}: {s.resourceId}
+                </p>
+              )}
+              {teamsStepNote(s, mode) && <p className="mt-0.5 text-xs text-slate-700">{teamsStepNote(s, mode)}</p>}
+              {s.verification && (
+                <p className="mt-0.5 text-xs text-slate-700">
+                  {s.verification === "verified"
+                    ? "Read back: verified in Notion."
+                    : s.verification === "not_performed"
+                      ? "Read back: not performed (dry run)."
+                      : "Read back: unavailable; creation succeeded but was not verified."}
+                </p>
+              )}
               <p className="mt-1 text-xs text-slate-500">
                 {s.attempt > 0 && <>Attempt {s.attempt}</>}
                 {s.lastErrorCode && <> · last error {s.lastErrorCode}</>}

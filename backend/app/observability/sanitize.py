@@ -37,10 +37,14 @@ CONTENT_KEYS = frozenset(
 # Secret-looking substrings inside free text.
 _SECRET_VALUE = re.compile(
     r"(sk-ant-[A-Za-z0-9_\-]{8,}"  # Anthropic keys
+    r"|gsk_[A-Za-z0-9]{16,}"  # Groq keys
+    r"|AIza[A-Za-z0-9_\-]{20,}"  # Google API keys (Gemini)
+    r"|ya29\.[A-Za-z0-9_\-.]{10,}|1//[A-Za-z0-9_\-]{10,}|GOCSPX-[A-Za-z0-9_\-]{10,}"  # Google OAuth tokens/secrets
     r"|sk-lf-[A-Za-z0-9_\-]{8,}|pk-lf-[A-Za-z0-9_\-]{8,}"  # Langfuse keys
     r"|(?i:bearer)\s+[A-Za-z0-9._\-~+/]{8,}=*"  # bearer tokens
     r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"  # JWTs
-    r"|https?://[^\s\"']*webhook[^\s\"']*)"  # webhook URLs (Teams incoming webhooks)
+    r"|https?://[^\s\"']*webhook[^\s\"']*"  # webhook URLs (Teams incoming webhooks)
+    r"|[?&]sig=[^&\s\"']+)"  # SAS signatures (Teams Workflows / Logic Apps trigger URLs)
 )
 
 

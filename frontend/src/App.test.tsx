@@ -1,8 +1,8 @@
-import { act, render, screen, waitFor, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it } from "vitest";
 
-import App from "./App";
+import { renderApp } from "./test/renderApp";
 import {
   DEFAULT_ROUTES,
   FakeEventSource,
@@ -25,7 +25,7 @@ const START_ROUTE: MockRoute = { method: "POST", path: "/api/v1/workflows/execut
 function setup(routes: MockRoute[] = []) {
   const fetchState = installFetch([...DEFAULT_ROUTES, PLAN_ROUTE, START_ROUTE, ...routes]);
   const user = userEvent.setup();
-  render(<App />);
+  renderApp("Multi-Integration");
   return { user, ...fetchState };
 }
 
@@ -95,7 +95,7 @@ describe("App", () => {
     const { user, calls } = setup();
     await generatePlan(user);
     const planCall = calls.find((c) => c.url === "/api/v1/workflows/plan");
-    expect(planCall?.body).toEqual({ instruction: TEMPLATES[0]!.example_instruction, name: "Meeting-to-Tasks" });
+    expect(planCall?.body).toEqual({ instruction: TEMPLATES[0]!.example_instruction, name: "Meeting-to-Tasks", mode: "mock", target: "multi" });
 
     expect(screen.getByText("Validated")).toBeInTheDocument();
     const steps = within(screen.getByRole("list", { name: "Planned steps" })).getAllByRole("listitem");
@@ -244,7 +244,7 @@ describe("App", () => {
       { path: "/health", networkError: true },
       { path: "/api/v1/workflows/templates", networkError: true },
     ]);
-    render(<App />);
+    renderApp("Multi-Integration");
     expect(await screen.findByText("API unreachable")).toBeInTheDocument();
     expect(await screen.findByText("Templates unavailable")).toBeInTheDocument();
   });

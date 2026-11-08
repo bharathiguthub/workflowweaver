@@ -1,14 +1,19 @@
-"""Fakes for Phase 5.1 integration tests. No test opens a real connection.
+"""Fakes for Phase 5 integration tests. No test opens a real connection.
 
-* ``FakeMcpServer`` implements the ``McpTransport`` protocol in memory: it speaks JSON-RPC
-  (initialize, notifications/initialized, tools/list with pagination, tools/call) and
-  simulates a Notion- or Drive-like server.
+* ``FakeMcpServer`` implements the ``McpTransport`` protocol in memory and advertises the
+  tool schemas from the sanitized fixtures in ``tests/fixtures/mcp``:
+    - notion: LIVE-captured tools/list of @notionhq/notion-mcp-server 2.6.1; tool results
+      and API errors follow that version's source (errors are normal text results whose
+      JSON is {"status": <http status>, "object": "error", "code", "message"}).
+    - drive: the DOCUMENTED schemas of the official drivemcp.googleapis.com server.
 * ``RecordingWebhookSender`` replaces the Teams webhook client.
 * ``integration_settings`` builds Settings with synthetic, obviously-fake secrets.
 All values are synthetic.
 """
 
+import copy
 import json
+import pathlib
 import random
 from typing import Any
 
@@ -20,26 +25,37 @@ from app.integrations.http.webhook import WebhookResponse
 from app.integrations.mcp.transport import SessionExpired
 from app.schemas.workflow import Integration
 
+FIXTURES = pathlib.Path(__file__).parent / "fixtures"
+NOTION_FIXTURE = json.loads((FIXTURES / "mcp" / "notion_mcp_2.6.1_tools_list.json").read_text(encoding="utf-8"))
+DRIVE_FIXTURE = json.loads((FIXTURES / "mcp" / "google_drive_mcp_documented_tools.json").read_text(encoding="utf-8"))
+TEAMS_FIXTURE = json.loads((FIXTURES / "teams_workflows_webhook.json").read_text(encoding="utf-8"))
+
 NOTION_TOKEN = "synthetic-notion-mcp-token-0001"
-DRIVE_TOKEN = "synthetic-drive-mcp-token-0002"
+DRIVE_TOKEN = "synthetic-drive-oauth-access-token-0002"
 OPERATOR_TOKEN = "synthetic-operator-token-0003"
-WEBHOOK_URL = "https://synthetic.webhook.office.com/webhookb2/SYNTHETIC-SECRET-PATH-0004"
-NOTION_PAGE_ID = "synthetic-notion-parent-0005"
-NOTION_DB_ID = "synthetic-notion-db-0006"
+WEBHOOK_SIG = "SYNTHETIC-SECRET-SIG-0004"
+WEBHOOK_URL = ("https://synthetic-tenant.westus.logic.azure.com:443/workflows/synthetic/triggers/manual/paths/"
+               f"invoke?api-version=2016-06-01&sp=%2Ftriggers%2Fmanual%2Frun&sv=1.0&sig={WEBHOOK_SIG}")
+NOTION_PAGE_ID = "5e1f0000-0000-4000-8000-000000000005"
+NOTION_DB_ID = "5e1f0000-0000-4000-8000-000000000006"
 DRIVE_FOLDER_ID = "synthetic-drive-folder-0007"
 OTHER_FOLDER_ID = "synthetic-unapproved-folder-0008"
-NOTION_MCP_URL = "https://synthetic-notion-mcp.example.invalid/mcp"
-DRIVE_MCP_URL = "https://synthetic-drive-mcp.example.invalid/mcp"
+NOTION_MCP_URL = "http://127.0.0.1:3999/mcp"
+DRIVE_MCP_URL = "https://drivemcp.googleapis.com/mcp/v1"
 DOCUMENT_TEXT = "SYNTHETIC-CONFIDENTIAL-DOCUMENT-TEXT"
 
-SECRETS = [NOTION_TOKEN, DRIVE_TOKEN, OPERATOR_TOKEN, WEBHOOK_URL, NOTION_PAGE_ID, NOTION_DB_ID,
-           DRIVE_FOLDER_ID, NOTION_MCP_URL, DRIVE_MCP_URL, DOCUMENT_TEXT, "SYNTHETIC-SECRET-PATH"]
+SECRETS = [NOTION_TOKEN, DRIVE_TOKEN, OPERATOR_TOKEN, WEBHOOK_URL, WEBHOOK_SIG, NOTION_PAGE_ID, NOTION_DB_ID,
+           DRIVE_FOLDER_ID, NOTION_MCP_URL, DOCUMENT_TEXT]
 
 
 def integration_settings(mode: str = "real", **overrides: Any) -> Settings:
     values: dict[str, Any] = dict(
         _env_file=None,
         integration_mode=mode,
+        # These fixtures exercise arbitrary approved destinations; sandbox confinement has
+        # its own tests (test_project_workflow.py).
+        notion_real_writes_sandbox_only=False,
+        teams_real_writes_sandbox_only=False,  # Teams sandbox confinement: tests/test_teams_workflow.py
         real_writes_enabled=True,
         real_write_authorization_token=OPERATOR_TOKEN,
         notion_mcp_url=NOTION_MCP_URL,
@@ -59,34 +75,51 @@ def integration_settings(mode: str = "real", **overrides: Any) -> Settings:
 
 
 def _text(payload: Any) -> dict[str, Any]:
-    return {"content": [{"type": "text", "text": json.dumps(payload) if not isinstance(payload, str) else payload}]}
+    return {"content": [{"type": "text", "text": payload if isinstance(payload, str) else json.dumps(payload)}]}
+
+
+def notion_error(status: int, code: str) -> dict[str, Any]:
+    """Exactly what notion-mcp-server 2.6.1 returns for a Notion API error (proxy.ts):
+    a normal tool result, text = JSON.stringify({status: 'error', ...notionErrorBody})."""
+    body = {"object": "error", "status": status, "code": code,
+            "message": "SYNTHETIC-REMOTE-ERROR-TEXT echoing an argument"}
+    return _text({"status": "error", **body} | {"status": status})
 
 
 class FakeMcpServer:
-    """In-memory MCP server behind the McpTransport protocol."""
+    """In-memory MCP server behind the McpTransport protocol, advertising fixture schemas."""
 
     def __init__(self, kind: str, *, protocol_version: str = "2025-06-18", page_size: int = 0,
-                 extra_tools: tuple[str, ...] = ("dangerous_delete_everything",)) -> None:
+                 drive_structured: bool = True) -> None:
         self.kind = kind
         self.protocol_version = protocol_version
         self.page_size = page_size
-        if kind == "notion":
-            names = ["API-post-page", "API-patch-page"]
-        else:
-            names = ["create_document", "search_documents", "read_document", "trash_file"]
-        self.tool_names = [*names, *extra_tools]
-        self.messages: list[dict[str, Any]] = []  # every request/notification received
+        self.drive_structured = drive_structured  # Drive docs do not say text vs structuredContent
+        fixture = NOTION_FIXTURE if kind == "notion" else DRIVE_FIXTURE
+        detailed = {t["name"]: copy.deepcopy(t) for t in fixture["tools"]}
+        self.tools = [detailed.get(n, {"name": n, "inputSchema": {"type": "object"}}) for n in fixture["tool_names"]]
+        self.messages: list[dict[str, Any]] = []
         self.tool_calls: list[tuple[str, dict[str, Any]]] = []
         self.failures: dict[str, list[Exception]] = {}  # tool name -> exceptions raised in order
+        self.notion_errors: dict[str, list[tuple[int, str]]] = {}  # tool -> Notion API errors in order
         self.tool_errors: set[str] = set()  # tools that answer isError: true
         self.expire_session_once = False
         self.closed = 0
         self.resources: dict[str, dict[str, Any]] = {}
         self.drive_files = [
-            {"id": "synthetic-doc-standup", "name": "Synthetic standup notes", "parents": [DRIVE_FOLDER_ID]},
-            {"id": "synthetic-doc-outside", "name": "Outside notes", "parents": [OTHER_FOLDER_ID]},
+            {"id": "synthetic-doc-standup", "title": "Synthetic standup notes", "parentId": DRIVE_FOLDER_ID,
+             "mimeType": "application/vnd.google-apps.document"},
+            {"id": "synthetic-doc-outside", "title": "Outside notes", "parentId": OTHER_FOLDER_ID,
+             "mimeType": "application/vnd.google-apps.document"},
         ]
         self._next = 0
+
+    @property
+    def tool_names(self) -> list[str]:
+        return [t["name"] for t in self.tools]
+
+    def schema(self, name: str) -> dict[str, Any]:
+        return next(t for t in self.tools if t["name"] == name)["inputSchema"]
 
     # ----- McpTransport -----
 
@@ -109,8 +142,9 @@ class FakeMcpServer:
             self.expire_session_once = False
             raise SessionExpired()
         if method == "initialize":
-            return self._ok(rid, {"protocolVersion": self.protocol_version, "capabilities": {"tools": {}},
-                                  "serverInfo": {"name": f"fake-{self.kind}", "version": "0"}})
+            info = NOTION_FIXTURE["initialize"] if self.kind == "notion" else {
+                "capabilities": {"tools": {}}, "serverInfo": {"name": "fake-drive", "version": "0"}}
+            return self._ok(rid, {**info, "protocolVersion": self.protocol_version})
         if method == "tools/list":
             return self._ok(rid, self._list(params.get("cursor")))
         if method == "tools/call":
@@ -124,60 +158,118 @@ class FakeMcpServer:
         return {"jsonrpc": "2.0", "id": rid, "result": result}
 
     def _list(self, cursor: str | None) -> dict[str, Any]:
-        tools = [{"name": n, "description": f"synthetic {n}", "inputSchema": {"type": "object"}}
-                 for n in self.tool_names]
         if not self.page_size:
-            return {"tools": tools}
+            return {"tools": self.tools}
         start = int(cursor or 0)
-        page = tools[start:start + self.page_size]
         nxt = start + self.page_size
-        return {"tools": page, **({"nextCursor": str(nxt)} if nxt < len(tools) else {})}
+        return {"tools": self.tools[start:nxt], **({"nextCursor": str(nxt)} if nxt < len(self.tools) else {})}
 
     def _call(self, rid: Any, name: str, args: dict[str, Any]) -> dict[str, Any]:
         self.tool_calls.append((name, args))
         queue = self.failures.get(name)
         if queue:
             raise queue.pop(0)
+        if self.notion_errors.get(name):
+            return self._ok(rid, notion_error(*self.notion_errors[name].pop(0)))
         if name in self.tool_errors:
             return self._ok(rid, {"isError": True, **_text(f"tool failed for {json.dumps(args)}")})
+        if name not in self.tool_names:  # notion-mcp-server: throw new Error(`Method ${name} not found`)
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32603, "message": f"Method {name} not found"}}
         self._next += 1
-        if name == "API-post-page":
-            pid = f"synthetic-page-{self._next}"
-            self.resources[pid] = {"archived": False, "args": args}
-            return self._ok(rid, _text({"object": "page", "id": pid, "url": f"https://www.notion.so/{pid}"}))
-        if name == "API-patch-page":
-            self.resources.setdefault(args["page_id"], {})["archived"] = args.get("archived")
-            return self._ok(rid, _text({"object": "page", "id": args["page_id"], "archived": True}))
-        if name == "create_document":
-            did = f"synthetic-created-doc-{self._next}"
-            self.resources[did] = {"trashed": False, "args": args}
-            return self._ok(rid, {"content": [], "structuredContent": {
-                "id": did, "webViewLink": f"https://docs.google.com/document/d/{did}"}})
-        if name == "search_documents":
-            files = [f for f in self.drive_files if f["name"] == args["name"]]
-            return self._ok(rid, _text({"files": files}))
-        if name == "read_document":
-            return self._ok(rid, _text(DOCUMENT_TEXT))
-        if name == "trash_file":
-            self.resources.setdefault(args["file_id"], {})["trashed"] = True
-            return self._ok(rid, _text({"ok": True}))
-        return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "bad"}}
+        handler = getattr(self, "_" + name.replace("-", "_").lower(), None)
+        if handler is None:
+            return {"jsonrpc": "2.0", "id": rid, "error": {"code": -32602, "message": "unsupported in fake"}}
+        return self._ok(rid, handler(args))
+
+    # Notion (Notion API page objects, JSON.stringify'd into one text item)
+    def _page(self, pid: str) -> dict[str, Any]:
+        """A Notion API page object (shape per the Notion API reference)."""
+        stored = self.resources[pid]
+        title_prop = next(iter(stored["args"].get("properties", {}).values()), {"title": []})
+        parent = dict(stored["args"].get("parent", {}))
+        parent.setdefault("type", "database_id" if "database_id" in parent else "page_id")
+        return {"object": "page", "id": pid, "url": f"https://www.notion.so/{pid.replace('-', '')}",
+                "in_trash": stored["in_trash"], "parent": parent,
+                "properties": {"title": {"id": "title", "type": "title", "title": [
+                    {"type": "text", "text": t["text"], "plain_text": t["text"]["content"]}
+                    for t in title_prop["title"]]}}}
+
+    def _api_post_page(self, args):
+        pid = f"5e1f0000-0000-4000-9000-{self._next:012d}"
+        self.resources[pid] = {"in_trash": False, "args": args}
+        return _text(self._page(pid))
+
+    def _api_patch_page(self, args):
+        if args["page_id"] not in self.resources:
+            return notion_error(404, "object_not_found")
+        self.resources[args["page_id"]]["in_trash"] = bool(args.get("in_trash"))
+        return _text(self._page(args["page_id"]))
+
+    def _api_retrieve_a_page(self, args):
+        page_id = args["page_id"]
+        if page_id == NOTION_PAGE_ID and page_id not in self.resources:  # the shared sandbox parent page
+            self.resources[page_id] = {"in_trash": False, "args": {"parent": {"type": "workspace", "workspace": True},
+                                                                   "properties": {"title": {"title": [
+                                                                       {"text": {"content": "Sandbox"}}]}}}}
+        if page_id not in self.resources:
+            return notion_error(404, "object_not_found")  # not shared with the integration
+        return _text(self._page(page_id))
+
+    # Google Drive (documented output shapes)
+    def _drive(self, payload: dict[str, Any]) -> dict[str, Any]:
+        if self.drive_structured:
+            return {"content": [{"type": "text", "text": json.dumps(payload)}], "structuredContent": payload}
+        return _text(payload)
+
+    def _create_file(self, args):
+        did = f"synthetic-created-doc-{self._next}"
+        self.resources[did] = {"args": args}
+        return self._drive({"id": did, "title": args.get("title"), "parentId": args.get("parentId"),
+                            "mimeType": "application/vnd.google-apps.document",
+                            "viewUrl": f"https://docs.google.com/document/d/{did}/edit"})
+
+    def _search_files(self, args):
+        self.last_query = args["query"]
+        files = [f for f in self.drive_files if f"title = '{f['title']}'" in args["query"]
+                 and f"parentId = '{f['parentId']}'" in args["query"]]
+        # A loose server might also return near-misses; include the outside doc to prove filtering.
+        files += [f for f in self.drive_files if f["parentId"] == OTHER_FOLDER_ID and f["title"] in args["query"]]
+        return self._drive({"files": files} if files else {})
+
+    def _get_file_metadata(self, args):
+        if args["fileId"] == DRIVE_FOLDER_ID:
+            return self._drive({"id": DRIVE_FOLDER_ID, "title": "Sandbox", "mimeType": "application/vnd.google-apps.folder"})
+        created = self.resources.get(args["fileId"])
+        if created is None:
+            return {"isError": True, **_text("File not found")}
+        a = created["args"]
+        return self._drive({"id": args["fileId"], "title": a.get("title"), "parentId": a.get("parentId"),
+                            "mimeType": "application/vnd.google-apps.document",
+                            "viewUrl": f"https://docs.google.com/document/d/{args['fileId']}/edit"})
+
+    def _read_file_content(self, args):
+        created = self.resources.get(args["fileId"])
+        text = created["args"].get("textContent", "") if created else DOCUMENT_TEXT
+        return self._drive({"fileContent": text, "contentAnchoredComments": [],
+                            "unanchoredComments": [], "textFormattingNotSupported": False,
+                            "commentsNotSupported": False})
 
     def calls_named(self, name: str) -> list[dict[str, Any]]:
         return [a for n, a in self.tool_calls if n == name]
 
 
 class RecordingWebhookSender:
-    def __init__(self) -> None:
+    def __init__(self, status_code: int = 202) -> None:
         self.posts: list[tuple[str, dict[str, Any]]] = []
         self.failures: list[Exception] = []
         self.closed = False
+        self.status_code = status_code
 
     def post_json(self, url: str, payload: dict[str, Any]) -> WebhookResponse:
         self.posts.append((url, payload))
         if self.failures:
             raise self.failures.pop(0)
-        return WebhookResponse(status_code=202)
+        return WebhookResponse(status_code=self.status_code)
 
     def close(self) -> None:
         self.closed = True

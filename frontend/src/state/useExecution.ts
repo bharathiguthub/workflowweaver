@@ -2,13 +2,19 @@ import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 
 import { errorMessage, getExecutionResult, startExecution } from "../api/client";
 import { openExecutionStream, type ConnectionState } from "../api/stream";
-import { TERMINAL_EVENT_TYPES, type ExecutionResponse, type ExecutionStartResponse, type PlanResponse } from "../api/types";
+import {
+  TERMINAL_EVENT_TYPES,
+  type ExecutionMode,
+  type ExecutionResponse,
+  type ExecutionStartResponse,
+  type PlanResponse,
+} from "../api/types";
 import { executionReducer, initialExecutionView } from "./execution";
 import { toExecutionRequest } from "./forms";
 
 export type ReportState = "idle" | "loading" | "loaded" | "unavailable" | "error";
 
-/** Starts a mock execution, follows its SSE stream, and loads the final report. */
+/** Starts an approved execution, follows its SSE stream, and loads the final report. */
 export function useExecution() {
   const [view, dispatch] = useReducer(executionReducer, initialExecutionView);
   const [connection, setConnection] = useState<ConnectionState | "idle">("idle");
@@ -77,13 +83,13 @@ export function useExecution() {
   }, []);
 
   const execute = useCallback(
-    async (plan: PlanResponse, approvedBy: string) => {
+    async (plan: PlanResponse, approvedBy: string, mode: ExecutionMode = "mock", operatorToken?: string) => {
       reset();
       const run = generation.current;
       setStarting(true);
       dispatch({ type: "init", workflowId: plan.workflow_id, steps: plan.planned_steps });
       try {
-        const start = await startExecution(toExecutionRequest(plan, approvedBy));
+        const start = await startExecution(toExecutionRequest(plan, approvedBy, mode), operatorToken);
         if (run !== generation.current) return;
         setStarted(start);
         connect(start, 0);

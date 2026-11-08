@@ -3,8 +3,8 @@
 POST /api/v1/workflows/executions
     Body: ExecutionRequest (same as POST /execute). Starts the run on a worker thread.
     202  ExecutionStartResponse {stream_url, stream_token, result_url}
-    409  workflow_id already executed with a different plan, its stream is still active,
-         or approval.mode does not match the server's INTEGRATION_MODE
+    409  workflow_id already executed with a different plan or mode, its stream is still
+         active, or approval.mode exceeds the server's INTEGRATION_MODE (the ceiling)
     422  invalid body
     503  streaming disabled (MOCK_EXECUTION_ENABLED=false or APP_ENV=production) / at capacity
 
@@ -32,7 +32,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, R
 from fastapi.responses import StreamingResponse
 
 from app.agents.execution.service import IdempotencyConflict, ModeMismatch
-from app.api.execution import _default_service, get_write_authorization
+from app.api.execution import _default_service, config_unavailable, get_write_authorization
 from app.core.config import get_settings
 from app.integrations.errors import IntegrationConfigError
 from app.schemas.events import ExecutionEvent, ExecutionStartResponse
@@ -65,10 +65,7 @@ def get_execution_runner() -> ExecutionRunner:
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "Streaming uses a mock-only access model and is disabled when APP_ENV=production.",
         )
-    try:
-        return _default_runner()
-    except IntegrationConfigError as exc:
-        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc)) from exc
+    return _default_runner()
 
 
 def get_heartbeat_seconds() -> float:
@@ -151,10 +148,13 @@ def start_execution(
         raise HTTPException(status.HTTP_409_CONFLICT, "An execution stream for this workflow_id is already active.") from exc
     except BrokerFull as exc:
         raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, "Too many active execution streams.") from exc
+    except IntegrationConfigError as exc:
+        raise config_unavailable(exc) from exc
     wf = str(payload.workflow_id)
     return ExecutionStartResponse(
         workflow_id=payload.workflow_id,
-        mode=runner.service.registry.mode.value,
+        # check_conflict() accepted this mode (at or below the server's ceiling).
+        mode=payload.approval.mode,
         stream_url=f"/api/v1/workflows/executions/{wf}/events?access_token={channel.token}",
         stream_token=channel.token,
         result_url=f"/api/v1/workflows/executions/{wf}",

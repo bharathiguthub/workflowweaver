@@ -38,33 +38,33 @@ def test_client_is_lazy_then_handshakes_and_discovers_in_order():
     server = FakeMcpServer("notion")
     client = client_for(server)
     assert server.messages == [] and not client.connected
-    result = client.call_tool("API-post-page", {"parent": {"page_id": "p"}})
+    result = client.call_tool("API-post-page", {"parent": {"page_id": "p"}, "properties": {}})
     assert methods(server) == ["initialize", "notifications/initialized", "tools/list", "tools/call"]
     init = server.messages[0]["params"]
     assert init["protocolVersion"] == "2025-06-18" and init["capabilities"] == {}
-    assert result.json_payload()["id"].startswith("synthetic-page-")
-    client.call_tool("API-post-page", {})
+    assert result.json_payload()["object"] == "page" and result.json_payload()["id"]
+    client.call_tool("API-post-page", {"parent": {"page_id": "p"}, "properties": {}})
     assert methods(server).count("initialize") == 1  # session reused
     assert client.connections == 1
 
 
 def test_discovery_keeps_only_allowlisted_tools_across_pages():
-    server = FakeMcpServer("notion", page_size=1)
-    assert set(client_for(server).list_tools()) == ALLOW  # "dangerous_delete_everything" dropped
-    assert methods(server).count("tools/list") == 3
+    server = FakeMcpServer("notion", page_size=5)  # the real 2.6.1 list has 24 tools
+    assert set(client_for(server).list_tools()) == ALLOW  # e.g. API-delete-a-block is dropped
+    assert methods(server).count("tools/list") == 5
 
 
 def test_non_allowlisted_tool_is_refused_before_any_network_traffic():
     server = FakeMcpServer("notion")
     with pytest.raises(IntegrationError) as info:
-        client_for(server).call_tool("dangerous_delete_everything", {})
+        client_for(server).call_tool("API-delete-a-block", {"block_id": "b"})  # offered, not allowlisted
     assert info.value.kind is ErrorKind.PERMISSION and info.value.code == "MCP_TOOL_NOT_ALLOWED"
     assert server.messages == []
 
 
 def test_allowlisted_tool_missing_on_server_is_unavailable():
     server = FakeMcpServer("notion")
-    server.tool_names.remove("API-patch-page")
+    server.tools = [t for t in server.tools if t["name"] != "API-patch-page"]
     with pytest.raises(IntegrationError) as info:
         client_for(server).call_tool("API-patch-page", {})
     assert info.value.code == "MCP_TOOL_UNAVAILABLE" and server.tool_calls == []
@@ -118,7 +118,7 @@ def test_expired_session_reconnects_once_and_sends_the_call_once():
     client = client_for(server)
     client.list_tools()
     server.expire_session_once = True
-    client.call_tool("API-post-page", {})
+    client.call_tool("API-post-page", {"parent": {"page_id": "p"}, "properties": {}})
     assert client.connections == 2 and len(server.tool_calls) == 1
 
 

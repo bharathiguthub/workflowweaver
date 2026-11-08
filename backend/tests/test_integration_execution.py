@@ -75,7 +75,7 @@ def test_dry_run_completes_without_creating_any_client_or_sending_anything():
     assert world.factories_called == [] and world.remote_calls() == 0
     assert "dry run" in response.message
     by_step = {r.step_number: r for r in response.step_results}
-    assert by_step[1].output["would_call"] == ["search_documents", "read_document"]
+    assert by_step[1].output["would_call"] == ["search_files", "read_file_content"]
     assert by_step[2].output == {"mode": "dry_run", "would_call": "API-post-page", "sent": False,
                                  "destination": "engineering", "title": "Sprint 42 kickoff"}
     assert by_step[4].output["channel"] == "synthetic-team" and by_step[4].output["delivered"] is False
@@ -95,8 +95,11 @@ def test_dry_run_failure_still_runs_saga_compensation_offline():
     world = FakeWorld("dry_run")
     world.registry.faults = FailureInjector({4: [Fault.PERMANENT]})
     response = world.service.execute(request(mode="dry_run"))
-    assert response.status is ExecutionStatus.ROLLED_BACK
-    assert [c.status.value for c in response.compensation_results] == ["COMPENSATED", "COMPENSATED"]
+    # Notion page: compensated offline. Drive document: the official Drive MCP server has no
+    # delete/trash tool, so create_document is irreversible in dry-run and real mode alike.
+    assert response.status is ExecutionStatus.PARTIALLY_ROLLED_BACK
+    assert {c.integration: c.status.value for c in response.compensation_results} == {
+        "google_drive": "NOT_COMPENSATABLE", "notion": "COMPENSATED"}
     assert world.remote_calls() == 0
 
 
@@ -121,7 +124,7 @@ def test_read_only_plan_needs_no_write_authorization():
     world = FakeWorld("real", real_writes_enabled=False)
     response = world.service.execute(request([FOUR_STEPS[0]]), write_authorized=False)
     assert response.status is ExecutionStatus.COMPLETED
-    assert [n for n, _ in world.drive.tool_calls] == ["search_documents", "read_document"]
+    assert [n for n, _ in world.drive.tool_calls] == ["search_files", "read_file_content"]
 
 
 def test_mode_mismatch_is_rejected():
@@ -163,8 +166,13 @@ def test_real_execution_resolves_destinations_server_side_and_completes():
     page_args = world.notion.calls_named("API-post-page")[0]
     assert page_args["parent"] == {"page_id": NOTION_PAGE_ID}
     assert page_args["properties"]["title"]["title"][0]["text"]["content"] == "Sprint 42 kickoff"
-    assert world.drive.calls_named("create_document")[0]["parent_folder_id"] == DRIVE_FOLDER_ID
-    assert world.drive.calls_named("search_documents")[0]["folder_ids"] == [DRIVE_FOLDER_ID]
+    created = world.drive.calls_named("create_file")[0]
+    assert created == {"title": "Sprint 42 summary", "textContent": "Synthetic summary",
+                       "contentMimeType": "text/plain", "parentId": DRIVE_FOLDER_ID}
+    search = world.drive.calls_named("search_files")[0]
+    assert search == {"query": f"title = 'Synthetic standup notes' and (parentId = '{DRIVE_FOLDER_ID}')",
+                      "pageSize": 50, "excludeContentSnippets": True}
+    assert world.drive.calls_named("read_file_content") == [{"fileId": "synthetic-doc-standup"}]
     url, card = world.teams.posts[0]
     assert url == WEBHOOK_URL
     assert card["attachments"][0]["content"]["body"][0]["text"] == "Synthetic: plan is ready"
@@ -174,7 +182,11 @@ def test_real_execution_resolves_destinations_server_side_and_completes():
                                  "content_length": len(DOCUMENT_TEXT)}  # contents withheld
     assert by_step[2].output["url"].startswith("https://www.notion.so/")
     assert by_step[3].output["url"].startswith("https://docs.google.com/")
-    assert by_step[4].output == {"mode": "real", "channel": "synthetic-team", "delivered": True}
+    # 2xx from a Workflows webhook is documented only as "request received", so: accepted.
+    teams_output = dict(by_step[4].output)
+    assert isinstance(teams_output.pop("latency_ms"), float)  # Phase 7.1: measured, value varies
+    assert teams_output == {"mode": "real", "channel": "synthetic-team", "accepted": True,
+                            "delivery": "accepted_by_webhook", "http_status": 202}
     assert_no_secrets(response.model_dump_json())
 
 
@@ -184,7 +196,7 @@ def test_notion_task_goes_to_the_configured_database():
               "arguments": {"title": "Synthetic task", "assignee": "synthetic.user", "due_date": "2026-12-01"}}]
     assert world.service.execute(request(steps), write_authorized=True).status is ExecutionStatus.COMPLETED
     args = world.notion.calls_named("API-post-page")[0]
-    assert args["parent"] == {"database_id": NOTION_DB_ID}
+    assert args["parent"] == {"type": "database_id", "database_id": NOTION_DB_ID}
     assert "synthetic.user" in json.dumps(args["children"])
 
 
@@ -195,7 +207,7 @@ def test_document_outside_approved_folders_is_not_read():
     response = world.service.execute(request(steps))
     assert response.status is ExecutionStatus.FAILED
     assert response.step_results[0].error.code == "DOCUMENT_NOT_FOUND"
-    assert world.drive.calls_named("read_document") == []
+    assert world.drive.calls_named("read_file_content") == []
 
 
 def test_transient_mcp_failure_before_send_is_retried_then_succeeds():
@@ -214,11 +226,13 @@ def test_write_timeout_after_send_is_outcome_unknown_and_not_retried():
     assert len(world.teams.posts) == 1  # no duplicate Teams message
     failed = next(r for r in response.step_results if r.status.value == "FAILED")
     assert failed.step_number == 4 and failed.error.code == "OUTCOME_UNKNOWN" and failed.attempts == 1
-    # Earlier reversible writes are rolled back through the MCP servers.
-    assert response.status is ExecutionStatus.ROLLED_BACK
+    # The Notion page is trashed through the verified API-patch-page contract; the Drive
+    # document cannot be rolled back (no delete tool on the official server) and remains.
+    assert response.status is ExecutionStatus.PARTIALLY_ROLLED_BACK
     page_id = response.step_results[1].resource_id
-    assert world.notion.calls_named("API-patch-page") == [{"page_id": page_id, "archived": True}]
-    assert len(world.drive.calls_named("trash_file")) == 1
+    assert world.notion.calls_named("API-patch-page") == [{"page_id": page_id, "in_trash": True}]
+    drive = next(c for c in response.compensation_results if c.integration == "google_drive")
+    assert drive.status.value == "NOT_COMPENSATABLE" and drive.attempts == 0
 
 
 def test_compensation_is_idempotent_and_retried_on_transient_errors():
@@ -227,7 +241,7 @@ def test_compensation_is_idempotent_and_retried_on_transient_errors():
     world.notion.failures["API-patch-page"] = [
         IntegrationError(ErrorKind.TRANSIENT, "MCP_SERVER_ERROR", "x", request_sent=True)]
     response = world.service.execute(request(), write_authorized=True)
-    assert response.status is ExecutionStatus.ROLLED_BACK
+    assert response.status is ExecutionStatus.PARTIALLY_ROLLED_BACK  # Drive doc is irreversible
     notion = next(c for c in response.compensation_results if c.integration == "notion")
     assert notion.attempts == 2 and notion.status.value == "COMPENSATED"
     # A second compensation of the same resource is a no-op.

@@ -9,18 +9,25 @@ redacted from logs and traces even if some library prints them.
 import ipaddress
 import json
 import re
+import uuid
 from dataclasses import dataclass, field
 from urllib.parse import urlsplit
 
+from pathlib import Path
+
 from pydantic import SecretStr
 
-from app.core.config import Settings
+from app.core.config import DriveTransport, Settings
+from app.integrations.contracts import CONTRACTS
 from app.integrations.errors import IntegrationConfigError
 from app.integrations.secrets import register_secret
 from app.schemas.workflow import Integration
 
 ALIAS_PATTERN = re.compile(r"^[a-z0-9][a-z0-9_-]{0,39}$")
 _LOOPBACK_HOSTS = {"localhost"}
+# Office 365 connector incoming webhooks were retired in May 2026 (Microsoft Learn); only
+# Teams Workflows (Power Automate) webhook URLs are accepted.
+_RETIRED_WEBHOOK_HOSTS = ("webhook.office.com", "outlook.office.com", "outlook.office365.com")
 
 
 def _is_loopback(host: str) -> bool:
@@ -93,6 +100,18 @@ class McpServerConfig:
 
 
 @dataclass(frozen=True)
+class DriveRestConfig:
+    """Google Drive REST API v3 + OAuth 2.0 (drive.file scope only). The token file is NOT
+    read here (no I/O at config time); the adapter reads it lazily on first use."""
+
+    client_id: str
+    client_secret: str = field(repr=False)
+    token_path: Path = field(repr=False)
+    connect_timeout_seconds: float = 5.0
+    timeout_seconds: float = 20.0
+
+
+@dataclass(frozen=True)
 class DestinationConfig:
     """Approved destinations: alias -> target id/URL. ``targets`` may be secret (Teams)."""
 
@@ -106,31 +125,19 @@ class DestinationConfig:
 
 
 @dataclass(frozen=True)
-class NotionToolNames:
-    create_page: str
-    archive_page: str
-
-
-@dataclass(frozen=True)
-class DriveToolNames:
-    create_document: str
-    search_documents: str
-    read_document: str
-    trash_file: str
-
-
-@dataclass(frozen=True)
 class IntegrationConfig:
     notion_mcp: McpServerConfig | None
-    notion_tools: NotionToolNames
+    notion_allowlist: frozenset[str]
     notion_pages: DestinationConfig
     notion_task_database: DestinationConfig
     drive_mcp: McpServerConfig | None
-    drive_tools: DriveToolNames
+    drive_allowlist: frozenset[str]
     drive_folders: DestinationConfig
     teams_channels: DestinationConfig
     connect_timeout_seconds: float
     timeout_seconds: float
+    drive_transport: DriveTransport = DriveTransport.MCP
+    drive_rest: DriveRestConfig | None = None  # set when GOOGLE_DRIVE_TRANSPORT=rest and the OAuth client is configured
 
 
 def _default_alias(alias: str | None, targets: dict[str, str], setting: str) -> str | None:
@@ -142,14 +149,39 @@ def _default_alias(alias: str | None, targets: dict[str, str], setting: str) -> 
     return alias
 
 
+def contract_allowlist(raw: str, integration: Integration, setting: str) -> frozenset[str]:
+    """The allowlist must be a non-empty subset of the verified contract's tools."""
+    tools = parse_allowlist(raw)
+    if not tools:
+        raise IntegrationConfigError(f"{setting} must name at least one tool.")
+    unknown = tools - set(CONTRACTS[integration])
+    if unknown:
+        raise IntegrationConfigError(
+            f"{setting} may only contain verified tools: {', '.join(sorted(CONTRACTS[integration]))}.")
+    return tools
+
+
+def validate_webhook_url(url: str, setting: str) -> str:
+    checked = validate_endpoint_url(url, setting, allow_loopback_http=False)
+    host = (urlsplit(checked).hostname or "").lower()
+    if any(host == h or host.endswith("." + h) for h in _RETIRED_WEBHOOK_HOSTS):
+        raise IntegrationConfigError(
+            f"{setting} contains a retired Office 365 connector webhook; use a Teams Workflows webhook URL.")
+    return checked
+
+
+def _notion_id(value: str, setting: str) -> str:
+    try:
+        return str(uuid.UUID(value.strip()))  # accepts dashed or 32-hex form
+    except ValueError as exc:
+        raise IntegrationConfigError(f"{setting}: every value must be a Notion page/database id (UUID).") from exc
+
+
 def _mcp(settings: Settings, integration: Integration, url: str | None, token: SecretStr | None,
-         allowlist: str, prefix: str) -> McpServerConfig | None:
+         tools: frozenset[str], prefix: str) -> McpServerConfig | None:
     if not url or not url.strip():
         return None
     checked = validate_endpoint_url(url, f"{prefix}_MCP_URL", allow_loopback_http=True)
-    tools = parse_allowlist(allowlist)
-    if not tools:
-        raise IntegrationConfigError(f"{prefix}_MCP_TOOL_ALLOWLIST must name at least one tool.")
     auth = _secret(token)
     register_secret(checked)
     register_secret(auth)
@@ -163,48 +195,62 @@ def _mcp(settings: Settings, integration: Integration, url: str | None, token: S
     )
 
 
-def _require_allowlisted(tools: list[str], allowlist: frozenset[str] | None, setting: str) -> None:
-    if allowlist is None:
-        return
-    missing = [t for t in tools if t not in allowlist]
-    if missing:
-        raise IntegrationConfigError(f"{setting} must include every configured tool name for this server.")
+def _drive_rest(settings: Settings) -> DriveRestConfig | None:
+    """Validated OAuth client settings for GOOGLE_DRIVE_TRANSPORT=rest (None if not configured).
+    The client secret is registered for redaction; the token path must be outside the repo."""
+    from app.integrations.google.oauth import resolve_token_path  # local: avoids an import cycle
+
+    if settings.google_drive_transport is not DriveTransport.REST:
+        return None
+    client_id = (settings.google_oauth_client_id or "").strip()
+    secret = _secret(settings.google_oauth_client_secret)
+    if not client_id and not secret:
+        return None
+    if not client_id or not secret:
+        raise IntegrationConfigError("GOOGLE_OAUTH_CLIENT_ID and GOOGLE_OAUTH_CLIENT_SECRET must both be set.")
+    if not client_id.endswith(".apps.googleusercontent.com"):
+        raise IntegrationConfigError("GOOGLE_OAUTH_CLIENT_ID must be an OAuth client id (*.apps.googleusercontent.com).")
+    register_secret(secret)
+    return DriveRestConfig(client_id=client_id, client_secret=secret,
+                           token_path=resolve_token_path(settings.google_drive_token_file),
+                           connect_timeout_seconds=settings.integration_connect_timeout_seconds,
+                           timeout_seconds=settings.integration_timeout_seconds)
 
 
 def load_integration_config(settings: Settings) -> IntegrationConfig:
     """Validate and normalise integration settings. Raises IntegrationConfigError.
 
     Never opens a connection."""
-    notion_targets = parse_alias_map(settings.notion_destinations, "NOTION_DESTINATIONS")
+    notion_targets = {alias: _notion_id(target, "NOTION_DESTINATIONS")
+                      for alias, target in parse_alias_map(settings.notion_destinations, "NOTION_DESTINATIONS").items()}
     drive_targets = parse_alias_map(settings.google_drive_destinations, "GOOGLE_DRIVE_DESTINATIONS")
     teams_targets = parse_alias_map(_secret(settings.teams_webhook_urls), "TEAMS_WEBHOOK_URLS")
     for alias, url in teams_targets.items():
-        teams_targets[alias] = validate_endpoint_url(url, "TEAMS_WEBHOOK_URLS", allow_loopback_http=False)
+        teams_targets[alias] = validate_webhook_url(url, "TEAMS_WEBHOOK_URLS")
         register_secret(teams_targets[alias])
+        # httpx logs the NORMALIZED URL (default ":443" dropped), so register that form too:
+        # the whole webhook URL, not only its sig= parameter, must never appear in a log line.
+        import httpx
+
+        register_secret(str(httpx.URL(teams_targets[alias])))
     for target in (*notion_targets.values(), *drive_targets.values()):
         register_secret(target)  # resource ids are not credentials, but keep them out of logs/traces too
 
+    notion_allowlist = contract_allowlist(settings.notion_mcp_tool_allowlist, Integration.NOTION,
+                                          "NOTION_MCP_TOOL_ALLOWLIST")
+    drive_allowlist = contract_allowlist(settings.google_drive_mcp_tool_allowlist, Integration.GOOGLE_DRIVE,
+                                         "GOOGLE_DRIVE_MCP_TOOL_ALLOWLIST")
     notion_mcp = _mcp(settings, Integration.NOTION, settings.notion_mcp_url, settings.notion_mcp_auth_token,
-                      settings.notion_mcp_tool_allowlist, "NOTION")
+                      notion_allowlist, "NOTION")
     drive_mcp = _mcp(settings, Integration.GOOGLE_DRIVE, settings.google_drive_mcp_url,
-                     settings.google_drive_mcp_auth_token, settings.google_drive_mcp_tool_allowlist, "GOOGLE_DRIVE")
+                     settings.google_drive_mcp_auth_token, drive_allowlist, "GOOGLE_DRIVE")
 
-    notion_tools = NotionToolNames(settings.notion_tool_create_page, settings.notion_tool_archive_page)
-    drive_tools = DriveToolNames(
-        settings.google_drive_tool_create_document,
-        settings.google_drive_tool_search_documents,
-        settings.google_drive_tool_read_document,
-        settings.google_drive_tool_trash_file,
-    )
-    _require_allowlisted([notion_tools.create_page, notion_tools.archive_page],
-                         notion_mcp.tool_allowlist if notion_mcp else None, "NOTION_MCP_TOOL_ALLOWLIST")
-    _require_allowlisted(list(vars(drive_tools).values()),
-                         drive_mcp.tool_allowlist if drive_mcp else None, "GOOGLE_DRIVE_MCP_TOOL_ALLOWLIST")
+    drive_rest = _drive_rest(settings)
 
     task_alias = _default_alias(settings.notion_task_database, notion_targets, "NOTION_TASK_DATABASE")
     return IntegrationConfig(
         notion_mcp=notion_mcp,
-        notion_tools=notion_tools,
+        notion_allowlist=notion_allowlist,
         notion_pages=DestinationConfig(
             Integration.NOTION, notion_targets,
             _default_alias(settings.notion_default_page_parent, notion_targets, "NOTION_DEFAULT_PAGE_PARENT"),
@@ -214,7 +260,7 @@ def load_integration_config(settings: Settings) -> IntegrationConfig:
             Integration.NOTION, {task_alias: notion_targets[task_alias]} if task_alias else {}, task_alias
         ),
         drive_mcp=drive_mcp,
-        drive_tools=drive_tools,
+        drive_allowlist=drive_allowlist,
         drive_folders=DestinationConfig(
             Integration.GOOGLE_DRIVE, drive_targets,
             _default_alias(settings.google_drive_default_folder, drive_targets, "GOOGLE_DRIVE_DEFAULT_FOLDER"),
@@ -225,4 +271,6 @@ def load_integration_config(settings: Settings) -> IntegrationConfig:
         ),
         connect_timeout_seconds=settings.integration_connect_timeout_seconds,
         timeout_seconds=settings.integration_timeout_seconds,
+        drive_transport=settings.google_drive_transport,
+        drive_rest=drive_rest,
     )

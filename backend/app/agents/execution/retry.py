@@ -34,6 +34,16 @@ class RetryPolicy:
             jitter=settings.execution_backoff_jitter,
         )
 
+    @classmethod
+    def for_planning(cls, settings: Settings) -> "RetryPolicy":
+        """Backoff between planner (LLM) attempts; attempts are bounded by MAX_PLANNING_ATTEMPTS."""
+        return cls(
+            max_attempts=settings.max_planning_attempts,
+            base_delay_seconds=settings.planning_backoff_base_seconds,
+            max_delay_seconds=settings.planning_backoff_max_seconds,
+            jitter=settings.planning_backoff_jitter,
+        )
+
     def should_retry(self, error: ToolError, attempt: int) -> bool:
         """``attempt`` is the 1-based number of the attempt that just failed."""
         return error.retryable and attempt < self.max_attempts

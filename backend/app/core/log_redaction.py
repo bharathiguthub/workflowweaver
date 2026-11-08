@@ -11,8 +11,17 @@ import re
 
 from app.integrations.secrets import scrub_secrets
 
-_TOKEN = re.compile(r"(access_token=)[^&\s\"']+", re.IGNORECASE)
+_TOKEN = re.compile(r"((?:access_token|refresh_token|client_secret|sig|[?&]code)=)[^&\s\"']+", re.IGNORECASE)
 REDACTED = r"\1[REDACTED]"
+# Google OAuth values by shape (defence in depth behind register_secret): access tokens
+# (ya29.), refresh tokens (1//) and OAuth client secrets (GOCSPX-).
+_GOOGLE = re.compile(r"\b(?:ya29\.[A-Za-z0-9_\-.]{10,}|1//[A-Za-z0-9_\-]{10,}|GOCSPX-[A-Za-z0-9_\-]{10,})")
+
+
+def _scrub(text: str) -> str:
+    # Registered secrets FIRST: a whole configured value (e.g. a Teams webhook URL) is replaced
+    # before the pattern pass rewrites part of it (sig=...), which would stop it matching.
+    return _GOOGLE.sub("[REDACTED]", _TOKEN.sub(REDACTED, scrub_secrets(text)))
 
 # Loggers that print request URLs.
 URL_LOGGERS = ("uvicorn.access", "uvicorn.error", "httpx")
@@ -20,12 +29,12 @@ URL_LOGGERS = ("uvicorn.access", "uvicorn.error", "httpx")
 
 def redact(value: object) -> object:
     if isinstance(value, str):
-        return scrub_secrets(_TOKEN.sub(REDACTED, value))
+        return _scrub(value)
     if isinstance(value, (int, float, bool)) or value is None:
         return value
     # e.g. httpx logs request.url as an httpx.URL object, not a str.
     text = str(value)
-    scrubbed = scrub_secrets(_TOKEN.sub(REDACTED, text))
+    scrubbed = _scrub(text)
     return scrubbed if scrubbed != text else value
 
 

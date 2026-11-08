@@ -22,9 +22,18 @@ from app.agents.execution.tools.base import (
     ToolResult,
 )
 from app.agents.execution.tools.registry import ToolRegistry
-from app.agents.validation import document_availability_issues, validate_draft
+from app.agents.validation import (
+    document_availability_issues,
+    drive_destination_issues,
+    integration_target_issues,
+    orchestration_issues,
+    plan_digest,
+    teams_destination_issues,
+    validate_draft,
+)
 from app.core.config import IntegrationMode
 from app.observability import get_telemetry
+from app.schemas.plan import IntegrationTarget, target_integrations
 from app.schemas.events import ExecutionEventType as Ev
 from app.streaming.emitter import emit
 from app.schemas.execution import (
@@ -121,6 +130,78 @@ class ExecutionNodes:
                     ExecutionError(code="INVALID_PLAN", message="Plan failed validation; nothing was executed.").model_dump()
                 ],
             }
+        target_problem = _target_problem(state)
+        if target_problem is not None:
+            code, message = target_problem
+            logger.info("node=prepare workflow_id=%s rejected=%s", state["workflow_id"], code)
+            return {**update, "status": "rejected", "errors": [ExecutionError(code=code, message=message).model_dump()]}
+        effective_target = state.get("recorded_target") or state.get("plan_target") or state.get("approved_target")
+        allowed = target_integrations(effective_target)
+        if allowed is not None:
+            # Re-validate the tool allowlist for the approved target right before execution.
+            target_issues = integration_target_issues(plan.steps, allowed)
+            if target_issues:
+                logger.info("node=prepare workflow_id=%s rejected=integration_not_allowed", state["workflow_id"])
+                return {
+                    **update,
+                    "status": "rejected",
+                    "validation_issues": [i.model_dump(mode="json") for i in target_issues],
+                    "errors": [ExecutionError(code="INVALID_PLAN",
+                                              message="Plan uses tools outside its integration target; "
+                                                      "nothing was executed.").model_dump()],
+                }
+            update["allowed_integrations"] = sorted(allowed)
+        folders = state.get("recorded_drive_folders")
+        if folders is not None:
+            # The Drive destinations approved at planning time are re-checked here, independent
+            # of the adapter's own sandbox configuration.
+            destination_issues = drive_destination_issues(plan.steps, folders)
+            if destination_issues:
+                logger.info("node=prepare workflow_id=%s rejected=drive_destination", state["workflow_id"])
+                return {
+                    **update,
+                    "status": "rejected",
+                    "validation_issues": [i.model_dump(mode="json") for i in destination_issues],
+                    "errors": [ExecutionError(code="INVALID_PLAN",
+                                              message="Plan writes outside its approved Google Drive destinations; "
+                                                      "nothing was executed.").model_dump()],
+                }
+        orchestration = effective_target == IntegrationTarget.DRIVE_NOTION_TEAMS.value
+        if orchestration:
+            # Drive + Notion + Teams: allowed actions, source binding, Notion hierarchy and
+            # Teams-last ordering are re-checked on the submitted plan, never trusted.
+            order_issues = orchestration_issues(plan.steps)
+            if order_issues:
+                logger.info("node=prepare workflow_id=%s rejected=orchestration_rules", state["workflow_id"])
+                return {
+                    **update,
+                    "status": "rejected",
+                    "validation_issues": [i.model_dump(mode="json") for i in order_issues],
+                    "errors": [ExecutionError(code="INVALID_PLAN",
+                                              message="Plan breaks the Drive + Notion + Teams workflow rules; "
+                                                      "nothing was executed.").model_dump()],
+                }
+        digest_problem = _digest_problem(state, plan.steps, effective_target, required=orchestration)
+        if digest_problem is not None:
+            logger.info("node=prepare workflow_id=%s rejected=approval_plan_mismatch", state["workflow_id"])
+            return {**update, "status": "rejected",
+                    "errors": [ExecutionError(code="APPROVAL_PLAN_MISMATCH", message=digest_problem).model_dump()]}
+        update["verify_resources"] = orchestration
+        channels = state.get("recorded_teams_channels")
+        if channels is not None:
+            # The Teams channels approved at planning time are re-checked here, independent of
+            # the adapter's own sandbox configuration.
+            channel_issues = teams_destination_issues(plan.steps, channels)
+            if channel_issues:
+                logger.info("node=prepare workflow_id=%s rejected=teams_destination", state["workflow_id"])
+                return {
+                    **update,
+                    "status": "rejected",
+                    "validation_issues": [i.model_dump(mode="json") for i in channel_issues],
+                    "errors": [ExecutionError(code="INVALID_PLAN",
+                                              message="Plan posts outside its approved Teams channels; "
+                                                      "nothing was executed.").model_dump()],
+                }
         if not state["approved"]:
             logger.info("node=prepare workflow_id=%s rejected=approval_required", state["workflow_id"])
             return {
@@ -136,6 +217,11 @@ class ExecutionNodes:
             logger.info("node=prepare workflow_id=%s rejected=%s", state["workflow_id"], code)
             return {**update, "status": "rejected", "errors": [ExecutionError(code=code, message=message).model_dump()]}
         steps = [s.model_dump(mode="json") for s in plan.steps]
+        if state.get("approved_plan_digest"):
+            # The approval is bound to exactly this plan (checked above); say so on the stream.
+            emit(Ev.APPROVAL_VERIFIED, plan_digest=state["approved_plan_digest"][:16], mode=self._registry.mode.value,
+                 write_count=sum(1 for s in plan.steps
+                                 if self._registry.effect_of(s.integration, s.action) is not Effect.READ_ONLY))
         emit(
             Ev.WORKFLOW_STARTED,
             mode=self._registry.mode.value,
@@ -152,7 +238,8 @@ class ExecutionNodes:
     def _authorization_problem(self, state: ExecutionState, plan_steps) -> tuple[str, str] | None:
         mode = self._registry.mode
         if state["requested_mode"] != mode.value:
-            return "MODE_MISMATCH", f"This server executes in '{mode.value}' mode; approval.mode must match."
+            return "MODE_MISMATCH", (f"approval.mode '{state['requested_mode']}' is not allowed; this executor runs "
+                                     f"'{mode.value}' mode and a client can never escalate the server's mode.")
         if mode is not IntegrationMode.REAL:
             return None
         writes = [s for s in plan_steps if self._registry.effect_of(s.integration, s.action) is not Effect.READ_ONLY]
@@ -184,10 +271,13 @@ class ExecutionNodes:
             arguments=dict(step["arguments"]),
             attempt=attempt,
             write_authorized=state["write_authorized"],
+            upstream=_upstream(state, step),
+            verify_after=bool(state.get("verify_resources")),
         )
         effect = self._registry.effect_of(integration, action)
         emit(Ev.STEP_STARTED, step_number=n, attempt=attempt, integration=integration.value, action=action.value)
 
+        allowed = state.get("allowed_integrations")
         with get_telemetry().observe(
             f"tool.{integration.value}.{action.value}",
             as_type="tool",
@@ -197,7 +287,12 @@ class ExecutionNodes:
             input={"argument_names": sorted(call.arguments)},
             metadata={"attempt": attempt, "effect": effect.value, "mode": self._registry.mode.value},
         ) as observation:
-            result, error = self._call_tool(call, effect)
+            if allowed is not None and integration.value not in allowed:
+                # Defence in depth: never call a tool outside the approved integration target.
+                result, error = None, ToolError(ErrorKind.PERMISSION, "INTEGRATION_NOT_ALLOWED",
+                                                f"{integration.value} is outside the approved integration target.")
+            else:
+                result, error = self._call_tool(call, effect)
             if error is None:
                 observation.update(output={"resource_id": result.resource_id, "replayed": result.replayed})
             else:
@@ -212,8 +307,14 @@ class ExecutionNodes:
                 "node=execute_step workflow_id=%s step=%d attempt=%d ok replayed=%s",
                 state["workflow_id"], n, attempt, result.replayed,
             )
+            # integration/action/effect are enum values (safe); the UI shows e.g. "Teams message accepted".
+            verification = result.output.get("verification")
+            if verification in ("verified", "unavailable", "not_performed"):
+                emit(Ev.RESOURCE_VERIFIED, step_number=n, integration=integration.value, action=action.value,
+                     resource_id=result.resource_id, status=verification)
             emit(Ev.STEP_SUCCEEDED, step_number=n, attempt=attempt, resource_id=result.resource_id,
-                 replayed=result.replayed)
+                 replayed=result.replayed, integration=integration.value, action=action.value, effect=effect.value,
+                 **({"verification": verification} if isinstance(verification, str) else {}))
             return {
                 "current_step": "execute_step",
                 "status": "running",
@@ -232,7 +333,8 @@ class ExecutionNodes:
         will_retry = self._policy.should_retry(error, attempt)
         emit(Ev.STEP_FAILED, step_number=n, attempt=attempt, error_code=error.code, error_kind=error.kind.value,
              retryable=error.retryable, will_retry=will_retry,
-             retries_exhausted=error.retryable and not will_retry)
+             retries_exhausted=error.retryable and not will_retry,
+             integration=integration.value, action=action.value, effect=effect.value)
         if will_retry:
             return {
                 "current_step": "execute_step",
@@ -253,6 +355,22 @@ class ExecutionNodes:
             )
         failed = self._step_result(step, StepStatus.FAILED, attempt, error=errors[0])
         skipped = [self._step_result(s, StepStatus.SKIPPED, 0) for s in state["steps"][index + 1 :]]
+        if state.get("verify_resources") and integration is Integration.TEAMS and not skipped:
+            # Drive + Notion + Teams: the notification is the last step and runs only after every
+            # Notion page was created AND read back. A failed (or ambiguous) notification does not
+            # undo that verified work: the pages are kept and the run is PARTIALLY_COMPLETED.
+            logger.warning("node=execute_step workflow_id=%s step=%d notification failed; keeping verified pages",
+                           state["workflow_id"], n)
+            return {
+                "current_step": "execute_step",
+                "status": "step_failed",
+                "last_outcome": "failed",
+                "attempts": attempts,
+                "failed_step": n,
+                "errors": errors,
+                "step_results": [failed],
+                "keep_completed": True,
+            }
         return {
             "current_step": "execute_step",
             "status": "step_failed",
@@ -510,6 +628,8 @@ def final_status(state: ExecutionState) -> ExecutionStatus:
         return ExecutionStatus.REJECTED
     if state["failed_step"] is None:
         return ExecutionStatus.COMPLETED
+    if state.get("keep_completed"):
+        return ExecutionStatus.PARTIALLY_COMPLETED
     if not state["journal"]:
         return ExecutionStatus.FAILED
     statuses = {c["status"] for c in state["compensation_results"]}
@@ -531,6 +651,11 @@ _MESSAGES = {
         "A step failed and at least one compensation also failed; manual review required."
     ),
     ExecutionStatus.REJECTED: "Request rejected before execution; nothing was executed.",
+    ExecutionStatus.PARTIALLY_COMPLETED: (
+        "Every Notion page was created and verified and is kept; the final Microsoft Teams notification failed or its "
+        "outcome is unknown (see errors). Teams messages cannot be unsent, so nothing was rolled back; check the channel "
+        "before notifying again."
+    ),
 }
 
 _COMPLETED_MESSAGES = {
@@ -552,5 +677,59 @@ def route_after_execute(state: ExecutionState) -> str:
     if outcome == "retry":
         return "retry_wait"
     if outcome == "failed":
+        if state.get("keep_completed"):
+            return "finalize"  # verified work is kept (drive_notion_teams notification failure)
         return "compensate" if state["journal"] else "finalize"
     return "execute_step" if state["current_index"] < len(state["steps"]) else "finalize"
+
+
+def _upstream(state: ExecutionState, step: dict[str, Any]) -> dict[int, str]:
+    """Resource ids created by this run's SUCCEEDED dependency steps (server state only)."""
+    deps = set(step.get("depends_on") or [])
+    out: dict[int, str] = {}
+    for r in state["step_results"]:
+        status = r["status"].value if hasattr(r["status"], "value") else r["status"]
+        if r["step_number"] in deps and status == StepStatus.SUCCEEDED.value and r.get("resource_id"):
+            out[r["step_number"]] = r["resource_id"]
+    return out
+
+
+# ---------- approval binding (Phase 7.2) ----------
+
+
+def _digest_problem(state: ExecutionState, steps, target: str | None, *, required: bool) -> str | None:
+    """The approval must be bound to the exact reviewed plan: the digest recorded when the plan was
+    produced, the digest in the approval and the digest of the submitted plan must all agree.
+    ``required``: plans of this target cannot run without a recorded, matching digest."""
+    recorded, approved = state.get("recorded_plan_digest"), state.get("approved_plan_digest")
+    # The recorded input digest (source + instructions) is part of the digest that was approved.
+    computed = plan_digest(steps, target, state.get("recorded_input_digest"))
+    if recorded is None:
+        if required:
+            return ("This workflow can only run a plan produced by the server in this session (no recorded plan "
+                    "digest); generate the plan again and approve it.")
+        if approved is not None and approved != computed:
+            return "The submitted plan differs from the plan that was approved."
+        return None
+    if approved != recorded:
+        return "The approval does not reference the plan that was reviewed (plan_digest mismatch)."
+    if computed != recorded:
+        return "The submitted plan differs from the plan that was reviewed and approved."
+    return None
+
+
+# ---------- integration target ----------
+
+
+def _target_problem(state: ExecutionState) -> tuple[str, str] | None:
+    """The approved target, the submitted plan's target and the target recorded at planning
+    time must agree wherever they are given. A client cannot relabel a plan."""
+    recorded, plan, approved = state.get("recorded_target"), state.get("plan_target"), state.get("approved_target")
+    if recorded is not None and plan is not None and plan != recorded:
+        return ("INTEGRATION_TARGET_MISMATCH",
+                f"The plan was generated for '{recorded}' but was submitted as '{plan}'.")
+    expected = recorded or plan
+    if approved is not None and expected is not None and approved != expected:
+        return ("INTEGRATION_TARGET_MISMATCH",
+                f"The approval is for '{approved}' but the plan's integration target is '{expected}'.")
+    return None

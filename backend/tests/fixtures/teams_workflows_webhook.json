@@ -1,0 +1,36 @@
+{
+  "_provenance": {
+    "source": "learn.microsoft.com/connectors/teams ('Microsoft Teams Webhook' trigger) and learn.microsoft.com/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook",
+    "method": "DOCUMENTED ONLY - official example payload copied verbatim; no live webhook was called.",
+    "captured": "2026-11-03",
+    "documented": [
+      "Request body must be a message with attachments; contentType 'application/vnd.microsoft.card.adaptive'; contentUrl 'should always be null'.",
+      "Message size limit 28 KB.",
+      "More than four requests per second are throttled; retry with exponential backoff.",
+      "Office 365 connector-based incoming webhooks were retired in May 2026.",
+      "Trigger authentication 'Anyone' must not receive an auth header; tenant/user options require an OAuth token."
+    ],
+    "not_documented": [
+      "Success status code (200 vs 202) and response body.",
+      "Whether a 2xx means the message was posted or only that the flow was triggered.",
+      "Idempotency / deduplication."
+    ]
+  },
+  "official_example": {
+    "type": "message",
+    "attachments": [
+      {
+        "contentType": "application/vnd.microsoft.card.adaptive",
+        "contentUrl": null,
+        "content": {
+          "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+          "type": "AdaptiveCard",
+          "version": "1.2",
+          "body": [
+            {"type": "TextBlock", "text": "For Samples and Templates, see [https://adaptivecards.io/samples](https://adaptivecards.io/samples)"}
+          ]
+        }
+      }
+    ]
+  }
+}

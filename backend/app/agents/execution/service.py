@@ -16,6 +16,7 @@ import random
 import threading
 import time
 
+from app.agents.plan_registry import get_plan_registry
 from app.agents.execution.graph import (
     build_execution_graph,
     execution_recursion_limit,
@@ -105,6 +106,8 @@ class ExecutionService:
                 "mode": request.approval.mode,
                 "server_mode": self.registry.mode.value,
                 "write_authorized": write_authorized,
+                "approved_target": _value(request.approval.integration_target),
+                "plan_target": _value(request.plan.integration_target),
             },
             metadata={"plan_fingerprint": fingerprint[:16], "max_attempts": self.policy.max_attempts},
         ) as observation:
@@ -142,6 +145,14 @@ class ExecutionService:
             mode=self.registry.mode.value,
             requested_mode=request.approval.mode,
             write_authorized=write_authorized,
+            approved_target=_value(request.approval.integration_target),
+            plan_target=_value(request.plan.integration_target),
+            recorded_target=get_plan_registry().get(request.workflow_id),
+            recorded_drive_folders=get_plan_registry().drive_folders(request.workflow_id),
+            recorded_teams_channels=get_plan_registry().teams_channels(request.workflow_id),
+            recorded_plan_digest=get_plan_registry().digest(request.workflow_id),
+            recorded_input_digest=get_plan_registry().input_digest(request.workflow_id),
+            approved_plan_digest=request.approval.plan_digest,
         )
         limit = execution_recursion_limit(len(request.plan.steps), self.policy.max_attempts)
         return self.graph.invoke(state, config={"recursion_limit": limit})
@@ -150,6 +161,7 @@ class ExecutionService:
 _OUTCOME_LEVEL = {
     ExecutionStatus.COMPLETED: "DEFAULT",
     ExecutionStatus.COMPENSATION_FAILED: "ERROR",
+    ExecutionStatus.PARTIALLY_COMPLETED: "WARNING",
 }
 
 
@@ -166,6 +178,10 @@ def outcome_summary(response: ExecutionResponse) -> dict:
         "error_codes": [e.code for e in response.errors],
         "compensation_statuses": {str(c.step_number): c.status.value for c in response.compensation_results},
     }
+
+
+def _value(target) -> str | None:
+    return getattr(target, "value", target) if target is not None else None
 
 
 def plan_fingerprint(request: ExecutionRequest) -> str:

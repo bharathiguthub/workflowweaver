@@ -49,12 +49,13 @@ SENSITIVE_INSTRUCTION = (
 
 
 def sensitive_steps():
-    """FOUR_STEPS with synthetic sensitive values in every free-text argument."""
+    """FOUR_STEPS with synthetic sensitive values in every free-text argument. (A Teams channel
+    must be an alias since Phase 7.1, so free text there is rejected by validation instead.)"""
     secret = " ".join(SENSITIVE_MARKERS)
     steps = json.loads(json.dumps(FOUR_STEPS))
     for step in steps:
         for key in step["arguments"]:
-            if key != "document_name":
+            if key not in ("document_name", "channel"):
                 step["arguments"][key] = f"{step['arguments'][key]} {secret}"
     return steps
 

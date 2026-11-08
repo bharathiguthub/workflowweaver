@@ -122,26 +122,85 @@ def _titles(arguments: dict[str, str]) -> dict[str, str]:
     return {"title": arguments["title"]} if "title" in arguments else {}
 
 
+def _mock_read_source(call: ToolCall) -> ToolResult:
+    """Phase 7.2: the deterministic source fixture with this file id; same checks as real."""
+    from app.agents.source_documents import SOURCE_FIXTURES
+
+    doc = SOURCE_FIXTURES.get(call.arguments["file_id"])
+    if doc is None:
+        raise ToolError(ErrorKind.PERMISSION, "SOURCE_NOT_ACCESSIBLE", "No synthetic source document with that id.")
+    if doc.name != call.arguments["document_name"]:
+        raise ToolError(ErrorKind.PERMANENT, "SOURCE_CHANGED", "The source document name does not match.")
+    expected = call.arguments.get("expected_sha256")
+    if expected and doc.sha256 != expected:
+        raise ToolError(ErrorKind.PERMANENT, "SOURCE_CHANGED", "The source document changed after it was reviewed.")
+    return ToolResult(integration=call.integration, action=call.action, effect=Effect.READ_ONLY,
+                      resource_id=doc.file_id, resource_type="drive_document",
+                      output={"document_name": doc.name, "file_id": doc.file_id, "content_length": len(doc.content),
+                              "sha256": doc.sha256, "source_verified": True})
+
+
 class MockNotionAdapter(_MockAdapter):
     integration = Integration.NOTION
     effects = {Action.CREATE_PAGE: Effect.REVERSIBLE, Action.CREATE_TASK: Effect.REVERSIBLE}
 
     def _perform(self, call: ToolCall) -> ToolResult:
         if call.action is Action.CREATE_PAGE:
+            raw = call.arguments.get("parent_step", "").strip()
+            if raw and not call.upstream.get(int(raw) if raw.isdigit() else -1):
+                raise ToolError(ErrorKind.PERMANENT, "PARENT_NOT_AVAILABLE", f"Step {raw} did not create a page.")
             return self._create(call, "mock-notion-page", "notion_page")
         return self._create(call, "mock-notion-task", "notion_task")
+
+    def verify(self, call: ToolCall, result: ToolResult) -> str:
+        """Read the in-memory page back (Phase 7.2 verification, simulated)."""
+        resource = self.store.resources.get(result.resource_id or "")
+        return "verified" if resource is not None and not resource["deleted"] else "failed"
 
 
 class MockGoogleDriveAdapter(_MockAdapter):
     integration = Integration.GOOGLE_DRIVE
-    effects = {Action.CREATE_DOCUMENT: Effect.REVERSIBLE, Action.READ_DOCUMENT: Effect.READ_ONLY}
+    effects = {Action.CREATE_DOCUMENT: Effect.REVERSIBLE, Action.READ_DOCUMENT: Effect.READ_ONLY,
+               Action.CREATE_FOLDER: Effect.REVERSIBLE, Action.LIST_FILES: Effect.READ_ONLY}
 
     def _perform(self, call: ToolCall) -> ToolResult:
+        parent = self._parent(call)
+        if call.action is Action.CREATE_FOLDER:
+            result = self._create(call, "mock-gdrive-folder", "drive_folder")
+            self.store.resources[result.resource_id]["parent"] = parent
+            return result.model_copy(update={"output": {**result.output, "name": call.arguments["name"]}})
         if call.action is Action.CREATE_DOCUMENT:
-            return self._create(call, "mock-gdrive-doc", "drive_document")
+            result = self._create(call, "mock-gdrive-doc", "drive_document")
+            self.store.resources[result.resource_id]["parent"] = parent
+            return result.model_copy(update={"output": {**result.output, "verified": True}})
+        if call.action is Action.LIST_FILES:
+            return self._list(call, parent)
         return self._read(call)
 
+    def _parent(self, call: ToolCall) -> str:
+        """The folder a Drive step works in: a folder created earlier in this run
+        (parent_step), else the folder alias (default 'mock-folder')."""
+        raw = call.arguments.get("parent_step", "").strip()
+        if raw:
+            parent = call.upstream.get(int(raw) if raw.isdigit() else -1)
+            if not parent:
+                raise ToolError(ErrorKind.PERMANENT, "PARENT_NOT_AVAILABLE", f"Step {raw} did not create a folder.")
+            return parent
+        return call.arguments.get("folder") or "mock-folder"
+
+    def _list(self, call: ToolCall, parent: str) -> ToolResult:
+        files = [
+            {"id": rid, "name": r["data"].get("title") or r["data"].get("name"), "type": r["type"]}
+            for rid, r in self.store.resources.items()
+            if r["integration"] == "google_drive" and not r["deleted"] and r.get("parent") == parent
+        ]
+        return ToolResult(integration=call.integration, action=call.action, effect=Effect.READ_ONLY,
+                          resource_id=None, resource_type="drive_listing",
+                          output={"file_count": len(files), "files": files})
+
     def _read(self, call: ToolCall) -> ToolResult:
+        if call.arguments.get("file_id"):
+            return _mock_read_source(call)
         name = call.arguments["document_name"]
         content = DRIVE_FIXTURES.get(name)
         resource_id = synthetic_id("mock-gdrive-fixture", name)
@@ -156,13 +215,18 @@ class MockGoogleDriveAdapter(_MockAdapter):
             if match is None:
                 raise ToolError(ErrorKind.PERMANENT, "DOCUMENT_NOT_FOUND", f"No synthetic document named '{name}'")
             resource_id, content = match[0], match[1]["data"]["content"]
+        expected = call.arguments.get("content_sha256")
+        if expected and hashlib.sha256(content.encode("utf-8")).hexdigest() != expected:
+            raise ToolError(ErrorKind.PERMANENT, "READ_BACK_MISMATCH",
+                            "The document read back does not match the uploaded content.")
         return ToolResult(
             integration=call.integration,
             action=call.action,
             effect=Effect.READ_ONLY,
             resource_id=resource_id,
             resource_type="drive_document",
-            output={"document_name": name, "content": content},
+            output={"document_name": name, "content": content,
+                    **({"content_verified": True} if expected else {})},
         )
 
 
@@ -172,8 +236,12 @@ class MockTeamsAdapter(_MockAdapter):
 
     def _perform(self, call: ToolCall) -> ToolResult:
         message_id = synthetic_id("mock-teams-msg", call.idempotency_key)
+        link_step = call.arguments.get("link_step", "").strip()
+        if link_step and not call.upstream.get(int(link_step) if link_step.isdigit() else -1):
+            raise ToolError(ErrorKind.PERMANENT, "LINK_NOT_AVAILABLE", f"Step {link_step} did not create a page.")
         self.store.messages.append(
-            {"id": message_id, "channel": call.arguments.get("channel", "general"), "text": call.arguments["message"]}
+            {"id": message_id, "channel": call.arguments.get("channel", "general"), "text": call.arguments["message"],
+             **({"links_page_from_step": int(link_step)} if link_step else {})}
         )
         return ToolResult(
             integration=call.integration,

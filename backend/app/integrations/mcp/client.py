@@ -14,6 +14,11 @@ Strict allowlist
   * Discovery keeps only allowlisted tools; an allowlisted tool the server does not offer
     is refused (PERMANENT ``MCP_TOOL_UNAVAILABLE``).
 
+Contract check (Phase 5.2)
+  * When ``contracts`` are given, each discovered allowlisted tool's input schema is
+    compared with what we send (``check_tool_schema``). A drifted tool is disabled: calls
+    fail with PERMANENT ``MCP_CONTRACT_MISMATCH`` before any request is sent.
+
 Results are typed (``McpToolResult``). Tool-level errors (``isError: true``) and JSON-RPC
 errors become ``IntegrationError`` with fixed messages; remote error text is never copied
 into messages, logs or traces because it can echo argument values.
@@ -30,6 +35,7 @@ from pydantic import BaseModel, Field
 
 from app.agents.execution.tools.base import ErrorKind
 from app.integrations.config import McpServerConfig
+from app.integrations.contracts import ToolContract, check_tool_schema
 from app.integrations.errors import IntegrationError
 from app.integrations.mcp.transport import McpTransport, SessionExpired, StreamableHttpTransport
 
@@ -38,7 +44,7 @@ logger = logging.getLogger(__name__)
 PROTOCOL_VERSION = "2025-06-18"
 SUPPORTED_PROTOCOL_VERSIONS = frozenset({"2025-06-18", "2025-03-26"})
 CLIENT_INFO = {"name": "workflowweaver", "version": "0.5.1"}
-MAX_TOOL_PAGES = 10
+MAX_TOOL_PAGES = 50  # pages of tools/list followed before giving up
 
 # JSON-RPC error codes
 _INVALID_PARAMS = -32602
@@ -78,8 +84,11 @@ def _protocol_error(message: str) -> IntegrationError:
 
 
 class McpClient:
-    def __init__(self, config: McpServerConfig, transport_factory: Callable[[], McpTransport] | None = None) -> None:
+    def __init__(self, config: McpServerConfig, transport_factory: Callable[[], McpTransport] | None = None,
+                 *, contracts: dict[str, ToolContract] | None = None) -> None:
         self.config = config
+        self.contracts = contracts or {}
+        self.contract_problems: dict[str, list[str]] = {}  # tool -> problems (names only)
         self.server = config.integration.value
         self._factory = transport_factory or (lambda: StreamableHttpTransport(
             config.url,
@@ -116,6 +125,9 @@ class McpClient:
         with self._lock:
             self._ensure_connected()
             assert self._tools is not None
+            if name in self.contract_problems:
+                raise IntegrationError(ErrorKind.PERMANENT, "MCP_CONTRACT_MISMATCH",
+                                       f"The {self.server} MCP tool schema no longer matches the verified contract.")
             if name not in self._tools:
                 raise IntegrationError(ErrorKind.PERMANENT, "MCP_TOOL_UNAVAILABLE",
                                        f"The {self.server} MCP server does not offer an allowlisted tool.")
@@ -195,6 +207,13 @@ class McpClient:
             cursor = result.get("nextCursor")
             if not cursor:
                 break
+        self.contract_problems = {}
+        for name, tool in tools.items():
+            contract = self.contracts.get(name)
+            problems = check_tool_schema(contract, tool.input_schema) if contract else []
+            if problems:
+                self.contract_problems[name] = problems
+                logger.warning("mcp server=%s tool=%s contract_mismatch=%s", self.server, name, problems)
         missing = sorted(self.config.tool_allowlist - set(tools))
         if missing:
             logger.warning("mcp server=%s allowlisted tools not offered count=%d", self.server, len(missing))

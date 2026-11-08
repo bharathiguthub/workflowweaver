@@ -1,14 +1,21 @@
 # Phase 1
 fastapi==0.115.6
 uvicorn[standard]==0.34.0
-pydantic==2.10.4
+pydantic==2.14.2  # >=2.12.5 required by google-genai (was 2.10.4)
 httpx==0.28.1
 pytest==8.3.4
 
 # Phase 2 - LangGraph planning agent + Claude
 langgraph==1.2.19
 anthropic==2.4.0
+# Phase 5 - Gemini planner (official Google Gen AI SDK)
+google-genai==2.34.0
+# Phase 5 - Groq fallback planner (official SDK; PLANNER_MODE=auto)
+groq==1.7.0
 pydantic-settings==2.16.2
 
 # Phase 4 - observability
 langfuse==5.1.0
+
+# Phase 5.2 - contract tests validate built arguments against captured MCP schemas
+jsonschema==4.23.0

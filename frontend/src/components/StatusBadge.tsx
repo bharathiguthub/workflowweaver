@@ -49,6 +49,7 @@ const WORKFLOW: Record<WorkflowUiStatus, { tone: Tone; label: string; pulse?: bo
   failed: { tone: "danger", label: "Failed" },
   rolled_back: { tone: "slate", label: "Rolled back" },
   partially_rolled_back: { tone: "warning", label: "Partially rolled back" },
+  partially_completed: { tone: "warning", label: "Partially completed" },
   compensation_failed: { tone: "danger", label: "Compensation failed" },
   rejected: { tone: "danger", label: "Rejected" },
   error: { tone: "danger", label: "Error" },

@@ -7,10 +7,15 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
+from app.api.documents import router as documents_router
+from app.api.drive_sandbox import router as drive_sandbox_router
 from app.api.execution import router as execution_router
 from app.api.execution import shutdown_execution_service
 from app.api.integrations import router as integrations_router
 from app.api.planning import router as planning_router
+from app.api.project import router as project_router
+from app.api.orchestration import router as orchestration_router
+from app.api.sandbox import router as sandbox_router
 from app.api.streaming import router as streaming_router
 from app.api.streaming import shutdown_runner
 from app.api.workflows import router as workflows_router
@@ -55,12 +60,17 @@ if _origins:
         allow_origins=_origins,
         allow_credentials=False,
         allow_methods=["GET", "POST"],
-        allow_headers=["Content-Type", "Last-Event-ID", "X-Stream-Token"],
+        allow_headers=["Content-Type", "Last-Event-ID", "X-Stream-Token", "X-Integration-Authorization"],
         max_age=600,
     )
 
 app.include_router(workflows_router)
 app.include_router(planning_router)
+app.include_router(sandbox_router)
+app.include_router(drive_sandbox_router)
+app.include_router(documents_router)
+app.include_router(project_router)
+app.include_router(orchestration_router)
 app.include_router(execution_router)
 app.include_router(streaming_router)
 app.include_router(integrations_router)

@@ -21,10 +21,12 @@ from pydantic import BaseModel, Field
 
 
 class ExecutionEventType(str, Enum):
+    APPROVAL_VERIFIED = "approval_verified"  # Phase 7.2: approval bound to the exact reviewed plan (digest match)
     WORKFLOW_STARTED = "workflow_started"  # plan re-validated and approved; steps about to run
     STEP_STARTED = "step_started"  # one tool attempt is starting (metadata.attempt)
     STEP_SUCCEEDED = "step_succeeded"
     STEP_FAILED = "step_failed"  # an attempt failed; metadata.will_retry says if it is retried
+    RESOURCE_VERIFIED = "resource_verified"  # Phase 7.2: read-back of a created resource (verified|unavailable|failed)
     RETRY_SCHEDULED = "retry_scheduled"  # backoff before the next attempt (phase: execution|compensation)
     COMPENSATION_STARTED = "compensation_started"  # undoing one journaled step
     COMPENSATION_COMPLETED = "compensation_completed"  # COMPENSATED | ALREADY_COMPENSATED | NOT_COMPENSATABLE

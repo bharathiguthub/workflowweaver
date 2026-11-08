@@ -1,5 +1,81 @@
 @import "tailwindcss";
 
+/*
+ * WorkflowWeaver design system (frontend redesign, phase 1): Bitwise red, white, charcoal and
+ * light gray.
+ *
+ *   brand-*     Bitwise red. brand-600 is the logo red #E1251B (white text on it: 4.7:1).
+ *               Primary actions, the active navigation item, focus rings and accents.
+ *   charcoal-*  Neutral charcoal / gray. charcoal-50 is the light-gray page background,
+ *               charcoal-900 the sidebar and headings.
+ *   Status colours stay semantic and separate from the brand: emerald = success,
+ *   amber = warning, sky = information, rose = danger / real writes.
+ *
+ * Existing components use the "indigo" (accent) and "slate" (neutral) scales. Both are remapped
+ * here to brand and charcoal, so every screen picks up the design system without class edits.
+ * New code should use brand-* and charcoal-* directly.
+ */
+@theme {
+  --font-sans: "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+
+  --color-brand-50: #fdf2f1;
+  --color-brand-100: #fbe0de;
+  --color-brand-200: #f7c0bc;
+  --color-brand-300: #f0918a;
+  --color-brand-400: #e8645b;
+  --color-brand-500: #e53f35;
+  --color-brand-600: #e1251b;
+  --color-brand-700: #bb1d15;
+  --color-brand-800: #971912;
+  --color-brand-900: #741510;
+  --color-brand-950: #420a07;
+
+  --color-charcoal-50: #f6f6f7;
+  --color-charcoal-100: #ededef;
+  --color-charcoal-200: #e0e0e3;
+  --color-charcoal-300: #c8c8cd;
+  --color-charcoal-400: #9a9aa2;
+  --color-charcoal-500: #6c6c74;
+  --color-charcoal-600: #54545b;
+  --color-charcoal-700: #3f3f45;
+  --color-charcoal-800: #2c2c31;
+  --color-charcoal-900: #1f1f23;
+  --color-charcoal-950: #141417;
+
+  /* Accent scale used by existing components -> brand red. */
+  --color-indigo-50: #fdf2f1;
+  --color-indigo-100: #fbe0de;
+  --color-indigo-200: #f7c0bc;
+  --color-indigo-300: #f0918a;
+  --color-indigo-400: #e8645b;
+  --color-indigo-500: #e53f35;
+  --color-indigo-600: #e1251b;
+  --color-indigo-700: #bb1d15;
+  --color-indigo-800: #971912;
+  --color-indigo-900: #741510;
+  --color-indigo-950: #420a07;
+
+  /* Neutral scale used by existing components -> charcoal / light gray. */
+  --color-slate-50: #f6f6f7;
+  --color-slate-100: #ededef;
+  --color-slate-200: #e0e0e3;
+  --color-slate-300: #c8c8cd;
+  --color-slate-400: #9a9aa2;
+  --color-slate-500: #6c6c74;
+  --color-slate-600: #54545b;
+  --color-slate-700: #3f3f45;
+  --color-slate-800: #2c2c31;
+  --color-slate-900: #1f1f23;
+  --color-slate-950: #141417;
+}
+
+html,
+body {
+  background-color: var(--color-charcoal-50);
+  color: var(--color-charcoal-900);
+  font-family: var(--font-sans);
+}
+
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
 }

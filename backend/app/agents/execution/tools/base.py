@@ -54,6 +54,11 @@ class ToolCall:
     # Server-verified authorization for real side effects (operator token checked by the
     # API). Real adapters refuse writes without it; mock and dry-run adapters ignore it.
     write_authorized: bool = False
+    # Resource ids created by THIS run's completed dependency steps (step_number -> id). Set
+    # by the executor, never by the client; used by notion create_page "parent_step".
+    upstream: dict[int, str] = field(default_factory=dict, compare=False)
+    # Phase 7.2: read the created resource back after a successful write (adapters that can).
+    verify_after: bool = False
 
     @property
     def idempotency_key(self) -> str:

@@ -1,4 +1,4 @@
-import { useId, useState, type FormEvent } from "react";
+import { useId, useState, type FormEvent, type ReactNode } from "react";
 
 import { integrationLabel, type WorkflowTemplate } from "../api/types";
 import { INSTRUCTION_MAX, validateInstruction, validateName } from "../state/forms";
@@ -9,10 +9,38 @@ interface Props {
   templatesState: "loading" | "loaded" | "error";
   templatesError: string | null;
   planning: boolean;
+  /** Set when the selected mode cannot plan templates or custom instructions (real mode). */
+  blockedReason?: string | null;
+  /** Shown above the form, e.g. what a Real-mode Google Drive plan may do. */
+  notice?: string | null;
+  /** "real" (default): a red Real mode notice; "info": a neutral notice for mock/dry-run. */
+  noticeTone?: "real" | "info";
   onSubmit: (instruction: string, name: string) => void;
+  /** Phase 8.2: section-specific heading and intro (defaults keep the original wording). */
+  heading?: string;
+  intro?: string;
+  /** A larger instruction box (AI Workflow Builder). */
+  prominent?: boolean;
+  placeholder?: string;
+  /** Rendered under the instruction, e.g. warnings about unsupported tools. */
+  renderHints?: (instruction: string) => ReactNode;
 }
 
-export function WorkflowInput({ templates, templatesState, templatesError, planning, onSubmit }: Props) {
+export function WorkflowInput({
+  templates,
+  templatesState,
+  templatesError,
+  planning,
+  blockedReason = null,
+  notice = null,
+  noticeTone = "real",
+  onSubmit,
+  heading = "1. Describe the workflow",
+  intro = "Start from a template or write your own instruction. Use synthetic data only.",
+  prominent = false,
+  placeholder = "e.g. Read meeting notes, create Notion tasks, and notify the team in Microsoft Teams.",
+  renderHints,
+}: Props) {
   const [instruction, setInstruction] = useState("");
   const [name, setName] = useState("");
   const [selected, setSelected] = useState<string | null>(null);
@@ -36,16 +64,31 @@ export function WorkflowInput({ templates, templatesState, templatesError, plann
   const submit = (event: FormEvent) => {
     event.preventDefault();
     setSubmitted(true);
-    if (instructionError || nameError || planning) return;
+    if (instructionError || nameError || planning || blockedReason) return;
     onSubmit(instruction, name);
   };
 
   return (
     <section aria-labelledby="describe-heading" className="rounded-xl border border-slate-200 bg-white p-4 shadow-sm sm:p-6">
       <h2 id="describe-heading" className="text-base font-semibold text-slate-900">
-        1. Describe the workflow
+        {heading}
       </h2>
-      <p className="mt-1 text-sm text-slate-600">Start from a template or write your own instruction. Use synthetic data only.</p>
+      <p className="mt-1 text-sm text-slate-600">{intro}</p>
+      {notice && !blockedReason && (
+        <p
+          className={`mt-2 rounded-lg p-2 text-sm ${noticeTone === "real" ? "bg-rose-50 text-rose-900" : "bg-sky-50 text-sky-900"}`}
+          aria-label={noticeTone === "real" ? "Real mode notice" : "Workflow notice"}
+        >
+          {notice}
+        </p>
+      )}
+      {blockedReason && (
+        <div className="mt-3">
+          <Alert tone="info" title="Not available in this mode">
+            {blockedReason}
+          </Alert>
+        </div>
+      )}
 
       <div className="mt-4">
         {templatesState === "loading" && <Spinner label="Loading templates…" />}
@@ -60,6 +103,7 @@ export function WorkflowInput({ templates, templatesState, templatesError, plann
               <li key={t.id}>
                 <button
                   type="button"
+                  disabled={Boolean(blockedReason)}
                   onClick={() => chooseTemplate(t)}
                   aria-pressed={selected === t.id}
                   className={`h-full w-full rounded-lg border p-3 text-left transition hover:border-indigo-400 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 ${
@@ -94,12 +138,12 @@ export function WorkflowInput({ templates, templatesState, templatesError, plann
               setInstruction(e.target.value);
               setSelected(null);
             }}
-            rows={4}
+            rows={prominent ? 7 : 4}
             maxLength={INSTRUCTION_MAX + 500}
             aria-invalid={Boolean(showInstructionError)}
             aria-describedby={`${instructionId}-help ${instructionId}-error`}
-            placeholder="e.g. Read meeting notes, create Notion tasks, and notify the team in Microsoft Teams."
-            className="mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 text-sm shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 aria-[invalid=true]:border-rose-400"
+            placeholder={placeholder}
+            className={`mt-1 block w-full rounded-lg border border-slate-300 px-3 py-2 ${prominent ? "text-base" : "text-sm"} shadow-sm focus:border-indigo-500 focus:outline-none focus:ring-2 focus:ring-indigo-500/30 aria-[invalid=true]:border-rose-400`}
           />
           <div className="mt-1 flex justify-between gap-2 text-xs">
             <p id={`${instructionId}-error`} className="text-rose-700">
@@ -109,6 +153,7 @@ export function WorkflowInput({ templates, templatesState, templatesError, plann
               {instruction.trim().length}/{INSTRUCTION_MAX}
             </p>
           </div>
+          {renderHints?.(instruction)}
         </div>
 
         <div>
@@ -131,7 +176,7 @@ export function WorkflowInput({ templates, templatesState, templatesError, plann
         <div className="flex items-center gap-3">
           <button
             type="submit"
-            disabled={planning}
+            disabled={planning || Boolean(blockedReason)}
             className="rounded-lg bg-indigo-600 px-4 py-2 text-sm font-semibold text-white shadow-sm hover:bg-indigo-700 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-indigo-600 disabled:cursor-not-allowed disabled:opacity-60"
           >
             Generate Plan

@@ -1,15 +1,16 @@
-"""Execution endpoints. The integration mode (mock | dry_run | real) is chosen by the server
-(INTEGRATION_MODE); mock is the default and calls no real service.
+"""Execution endpoints. Each request selects its integration mode with ``approval.mode``;
+the server's INTEGRATION_MODE is the ceiling (mock < dry_run < real) and a request above it
+is rejected with MODE_MISMATCH. Mock is the default and calls no real service.
 
 POST /api/v1/workflows/execute
   Header X-Integration-Authorization: operator token, needed only for real-mode writes.
   200  COMPLETED                  all steps succeeded
   403  REJECTED                   approval.approved is false, real writes disabled, or the
                                   operator authorization is missing/invalid (nothing executed)
-  409  REJECTED                   approval.mode does not match the server's mode
+  409  REJECTED                   approval.mode exceeds the server's INTEGRATION_MODE
   422  REJECTED                   plan failed re-validation (body: ExecutionResponse)
   422                             request body invalid (FastAPI "detail")
-  409                             workflow_id already used for a different plan
+  409                             workflow_id already used for a different plan or mode
   502  FAILED | ROLLED_BACK | PARTIALLY_ROLLED_BACK | COMPENSATION_FAILED
                                   a tool step failed; see errors / compensation_results
   503                             execution disabled (MOCK_EXECUTION_ENABLED=false) or
@@ -28,6 +29,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Header, HTTPException, status
 from fastapi.responses import JSONResponse
 
+from app.agents.execution.modes import ModeRoutedExecutionService
 from app.agents.execution.retry import RetryPolicy
 from app.agents.execution.service import ExecutionService, IdempotencyConflict
 from app.agents.execution.tools import create_tool_registry
@@ -43,34 +45,44 @@ _HTTP_STATUS = {
     ExecutionStatus.ROLLED_BACK: status.HTTP_502_BAD_GATEWAY,
     ExecutionStatus.PARTIALLY_ROLLED_BACK: status.HTTP_502_BAD_GATEWAY,
     ExecutionStatus.COMPENSATION_FAILED: status.HTTP_502_BAD_GATEWAY,
+    ExecutionStatus.PARTIALLY_COMPLETED: status.HTTP_502_BAD_GATEWAY,
 }
 
 
-@lru_cache(maxsize=1)
-def _default_service() -> ExecutionService:
+def _build_service(mode: IntegrationMode) -> ExecutionService:
+    """One ExecutionService per mode; ``mode`` is at or below the server's ceiling."""
     settings = get_settings()
+    mode_settings = settings if mode is settings.integration_mode else settings.model_copy(
+        update={"integration_mode": mode})
     return ExecutionService(
-        create_tool_registry(settings),
+        create_tool_registry(mode_settings),
         RetryPolicy.from_settings(settings),
         max_steps=settings.max_workflow_steps,
     )
 
 
-def get_execution_service() -> ExecutionService:
+@lru_cache(maxsize=1)
+def _default_service() -> ModeRoutedExecutionService:
+    return ModeRoutedExecutionService(get_settings().integration_mode, _build_service)
+
+
+def get_execution_service() -> ModeRoutedExecutionService:
     if not get_settings().mock_execution_enabled:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Mock execution is disabled."
         )
-    try:
-        return _default_service()
-    except IntegrationConfigError as exc:  # message names the setting, never its value
-        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc)) from exc
+    return _default_service()
+
+
+def config_unavailable(exc: IntegrationConfigError) -> HTTPException:
+    # The message names the setting, never its value.
+    return HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=str(exc))
 
 
 def shutdown_execution_service() -> None:
-    """Close MCP sessions / HTTP pools of the cached service, if one was built."""
+    """Close MCP sessions / HTTP pools of the cached services, if any were built."""
     if _default_service.cache_info().currsize:
-        _default_service().registry.close()
+        _default_service().close()
         _default_service.cache_clear()
 
 
@@ -91,7 +103,8 @@ def get_write_authorization(
     return verify_write_authorization(get_settings(), x_integration_authorization)
 
 
-_FORBIDDEN_CODES = {"APPROVAL_REQUIRED", "REAL_WRITES_DISABLED", "REAL_WRITE_AUTHORIZATION_REQUIRED"}
+_FORBIDDEN_CODES = {"APPROVAL_REQUIRED", "REAL_WRITES_DISABLED", "REAL_WRITE_AUTHORIZATION_REQUIRED",
+                    "INTEGRATION_TARGET_MISMATCH"}
 
 
 def http_status_for(response: ExecutionResponse) -> int:
@@ -118,19 +131,21 @@ def http_status_for(response: ExecutionResponse) -> int:
 )
 def execute_workflow(
     payload: ExecutionRequest,
-    service: ExecutionService = Depends(get_execution_service),
+    service: ModeRoutedExecutionService = Depends(get_execution_service),
     write_authorized: bool = Depends(get_write_authorization),
 ) -> JSONResponse:
     try:
         result = service.execute(payload, write_authorized=write_authorized)
     except IdempotencyConflict as exc:
         raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail=str(exc)) from exc
+    except IntegrationConfigError as exc:
+        raise config_unavailable(exc) from exc
     return JSONResponse(status_code=http_status_for(result), content=result.model_dump(mode="json"))
 
 
 @router.get("/executions/{workflow_id}", response_model=ExecutionResponse)
 def get_execution(
-    workflow_id: UUID, service: ExecutionService = Depends(get_execution_service)
+    workflow_id: UUID, service: ModeRoutedExecutionService = Depends(get_execution_service)
 ) -> ExecutionResponse:
     result = service.get(str(workflow_id))
     if result is None:

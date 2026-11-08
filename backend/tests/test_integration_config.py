@@ -116,9 +116,14 @@ def test_default_destination_must_be_a_configured_alias():
         load_integration_config(integration_settings(google_drive_default_folder="not-configured"))
 
 
-def test_configured_tool_names_must_be_allowlisted():
+def test_allowlist_may_only_contain_verified_contract_tools():
+    # Phase 5.2: tool names are fixed by the verified contract; the allowlist can only narrow.
     with pytest.raises(IntegrationConfigError, match="NOTION_MCP_TOOL_ALLOWLIST"):
-        load_integration_config(integration_settings(notion_mcp_tool_allowlist="API-post-page"))
+        load_integration_config(integration_settings(notion_mcp_tool_allowlist="API-post-page,API-delete-a-block"))
+    with pytest.raises(IntegrationConfigError, match="GOOGLE_DRIVE_MCP_TOOL_ALLOWLIST"):
+        load_integration_config(integration_settings(google_drive_mcp_tool_allowlist="search_files,trash_file"))
+    narrowed = load_integration_config(integration_settings(notion_mcp_tool_allowlist="API-post-page"))
+    assert narrowed.notion_allowlist == {"API-post-page"}
 
 
 def test_configuration_errors_never_contain_secret_values():

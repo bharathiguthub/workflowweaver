@@ -1,0 +1,184 @@
+{
+  "_provenance": {
+    "server": "Google Drive remote MCP server (official, Google-hosted)",
+    "endpoint": "https://drivemcp.googleapis.com/mcp/v1",
+    "method": "DOCUMENTED ONLY - transcribed from developers.google.com/workspace/drive/api/reference/mcp and its per-tool pages. NOT captured from a live tools/list: the server requires OAuth 2.0 and Google Workspace Developer Preview Program membership, which this project does not have.",
+    "captured": "2026-11-03",
+    "required_markers": "Only fields the docs mark 'Required' are listed in 'required'. search_files.query is not explicitly marked required in the docs, so it is not listed.",
+    "notes": [
+      "No tool deletes, trashes, moves or updates a file; files created by create_file cannot be rolled back through MCP.",
+      "search_files uses its own query syntax ('query_term operator values'), e.g. title = 'x' and parentId = 'y'; strings are single-quoted and embedded quotes escaped as \\'.",
+      "read_file_content: 'don't make assumptions about the particular format of the text returned'."
+    ]
+  },
+  "tool_names": [
+    "copy_file",
+    "create_file",
+    "download_file_content",
+    "get_file_metadata",
+    "get_file_permissions",
+    "list_recent_files",
+    "read_file_content",
+    "search_files"
+  ],
+  "tools": [
+    {
+      "name": "search_files",
+      "description": "Search for Drive files using a structured query (syntax: `query_term operator values`).",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "The search query."
+          },
+          "pageToken": {
+            "type": "string"
+          },
+          "pageSize": {
+            "type": "integer",
+            "description": "The maximum number of files to return in each page."
+          },
+          "excludeContentSnippets": {
+            "type": "boolean",
+            "description": "If true, the content snippet will be excluded from the response."
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "read_file_content",
+      "description": "fetch a natural language representation of a Drive file, and optionally, its comments.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "fileId": {
+            "type": "string",
+            "description": "Required. The ID of the file to retrieve."
+          },
+          "includeComments": {
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "fileId"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    },
+    {
+      "name": "create_file",
+      "description": "create or upload a File to Google Drive.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "title": {
+            "type": "string",
+            "description": "The title of the file."
+          },
+          "mimeType": {
+            "type": "string",
+            "description": "DEPRECATED. DO NOT USE!! Set content_mime_type instead."
+          },
+          "contentMimeType": {
+            "type": "string",
+            "description": "Required when any type of content is provided."
+          },
+          "content": {
+            "type": "string",
+            "description": "DEPRECATED (base64)."
+          },
+          "base64Content": {
+            "type": "string"
+          },
+          "textContent": {
+            "type": "string",
+            "description": "The (UTF-8) text content to upload."
+          },
+          "parentId": {
+            "type": "string",
+            "description": "The parent id of the file."
+          },
+          "disableConversionToGoogleType": {
+            "type": "boolean"
+          }
+        },
+        "required": []
+      },
+      "annotations": {
+        "readOnlyHint": false,
+        "destructiveHint": false,
+        "idempotentHint": false,
+        "openWorldHint": true
+      }
+    },
+    {
+      "name": "get_file_metadata",
+      "description": "find general metadata about a user's Drive file.",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "fileId": {
+            "type": "string",
+            "description": "Required. The ID of the file to retrieve."
+          },
+          "excludeContentSnippets": {
+            "type": "boolean",
+            "description": "If true, the content snippet will be excluded from the response."
+          }
+        },
+        "required": [
+          "fileId"
+        ]
+      },
+      "annotations": {
+        "readOnlyHint": true,
+        "destructiveHint": false,
+        "idempotentHint": true,
+        "openWorldHint": false
+      }
+    }
+  ],
+  "documented_outputs": {
+    "File": [
+      "id",
+      "title",
+      "parentId",
+      "mimeType",
+      "fileSize",
+      "description",
+      "fileExtension",
+      "contentSnippet",
+      "viewUrl",
+      "sharedWithMeTime",
+      "createdTime",
+      "modifiedTime",
+      "viewedByMeTime",
+      "owner",
+      "canAddChildren"
+    ],
+    "SearchFilesResponse": [
+      "files",
+      "nextPageToken"
+    ],
+    "ReadFileContentResponse": [
+      "contentAnchoredComments",
+      "unanchoredComments",
+      "fileContent",
+      "textFormattingNotSupported",
+      "commentsNotSupported"
+    ]
+  }
+}

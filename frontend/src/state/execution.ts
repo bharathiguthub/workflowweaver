@@ -23,6 +23,7 @@ export type WorkflowUiStatus =
   | "failed"
   | "rolled_back"
   | "partially_rolled_back"
+  | "partially_completed"
   | "compensation_failed"
   | "rejected"
   | "error";
@@ -37,6 +38,10 @@ export interface StepView {
   retryDelaySeconds: number | null;
   resourceId: string | null;
   compensationStatus: string | null;
+  /** The step's "title" argument (e.g. the Notion page title), for display. */
+  title: string | null;
+  /** Phase 7.2 read-back of the created resource: verified | unavailable | not_performed. */
+  verification: string | null;
 }
 
 export interface ExecutionView {
@@ -68,6 +73,7 @@ const TERMINAL_STATUS_TO_UI: Record<TerminalStatus, WorkflowUiStatus> = {
   FAILED: "failed",
   ROLLED_BACK: "rolled_back",
   PARTIALLY_ROLLED_BACK: "partially_rolled_back",
+  PARTIALLY_COMPLETED: "partially_completed",
   COMPENSATION_FAILED: "compensation_failed",
   REJECTED: "rejected",
   ERROR: "error",
@@ -97,6 +103,11 @@ function applyEvent(state: ExecutionView, event: ExecutionEvent): ExecutionView 
         retryDelaySeconds: null,
       });
       workflowStatus = "running";
+      break;
+    case "resource_verified":
+      steps = updateStep(steps, n, { verification: asString(m.status) });
+      break;
+    case "approval_verified":
       break;
     case "step_succeeded":
       steps = updateStep(steps, n, { status: "succeeded", resourceId: asString(m.resource_id), lastErrorCode: null });
@@ -161,6 +172,8 @@ export function executionReducer(state: ExecutionView, action: ExecutionAction):
           retryDelaySeconds: null,
           resourceId: null,
           compensationStatus: null,
+          title: s.arguments?.title ?? null,
+          verification: null,
         })),
       };
     case "event": {
@@ -176,4 +189,4 @@ export function executionReducer(state: ExecutionView, action: ExecutionAction):
 }
 
 export const isTerminalStatus = (status: WorkflowUiStatus): boolean =>
-  ["completed", "failed", "rolled_back", "partially_rolled_back", "compensation_failed", "rejected", "error"].includes(status);
+  ["completed", "failed", "rolled_back", "partially_rolled_back", "partially_completed", "compensation_failed", "rejected", "error"].includes(status);

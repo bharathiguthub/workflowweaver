@@ -12,6 +12,19 @@ htmlcov/
 .env
 .env.*
 !.env.example
+# Google OAuth tokens/client files must never be committed (the app also refuses token paths in the repo)
+*google-drive-token*.json
+client_secret*.json
+# Other local credential files (OAuth/service-account JSON, keys, certificates, direnv)
+credentials*.json
+service-account*.json
+token.json
+*.pem
+*.key
+*.p12
+*.pfx
+.envrc
+.secrets/
 
 # Node / frontend (future phases)
 node_modules/
