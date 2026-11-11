@@ -41,6 +41,7 @@ _SECRET_VALUE = re.compile(
     r"|AIza[A-Za-z0-9_\-]{20,}"  # Google API keys (Gemini)
     r"|ya29\.[A-Za-z0-9_\-.]{10,}|1//[A-Za-z0-9_\-]{10,}|GOCSPX-[A-Za-z0-9_\-]{10,}"  # Google OAuth tokens/secrets
     r"|sk-lf-[A-Za-z0-9_\-]{8,}|pk-lf-[A-Za-z0-9_\-]{8,}"  # Langfuse keys
+    r"|ntn_[A-Za-z0-9]{20,}|secret_[A-Za-z0-9]{30,}"  # Notion integration tokens
     r"|(?i:bearer)\s+[A-Za-z0-9._\-~+/]{8,}=*"  # bearer tokens
     r"|eyJ[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{10,}\.[A-Za-z0-9_\-]{5,}"  # JWTs
     r"|https?://[^\s\"']*webhook[^\s\"']*"  # webhook URLs (Teams incoming webhooks)
@@ -48,8 +49,13 @@ _SECRET_VALUE = re.compile(
 )
 
 
+def scrub_secret_values(value: str) -> str:
+    """Registered secrets and secret-looking substrings removed; NOT truncated (log lines)."""
+    return _SECRET_VALUE.sub(REDACTED, scrub_secrets(value))
+
+
 def scrub_text(value: str) -> str:
-    value = _SECRET_VALUE.sub(REDACTED, scrub_secrets(value))
+    value = scrub_secret_values(value)
     if len(value) > MAX_STRING:
         value = value[:MAX_STRING] + f"...[truncated {len(value) - MAX_STRING} chars]"
     return value

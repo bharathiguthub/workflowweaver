@@ -666,3 +666,115 @@ export interface DocumentPreview {
   content: string;
   checks: string[];
 }
+
+// ---------- app/api/monitoring.py (Phase 8 monitoring; values are from THIS API process) ----------
+
+export type ServiceProbeStatus = "up" | "down" | "not_configured";
+
+export interface MonitoringService {
+  name: string;
+  configured: boolean;
+  status: ServiceProbeStatus;
+  http_status?: number;
+  latency_ms?: number;
+  error?: string;
+}
+
+export interface MonitoringSummary {
+  scope: string;
+  generated_at: string;
+  process_started_at: string;
+  uptime_seconds: number;
+  config: {
+    service_name: string;
+    environment: string;
+    log_format: "json" | "console";
+    log_level: string;
+    metrics_enabled: boolean;
+    metrics_protected: boolean;
+    tracing_enabled: boolean;
+    langfuse_enabled: boolean;
+  };
+  links: { grafana: string | null; langfuse: string | null; dashboards: { uid: string; title: string; url: string }[] };
+  services: MonitoringService[];
+  api: {
+    requests: number;
+    errors_4xx: number;
+    errors_5xx: number;
+    error_rate_5xx: number | null;
+    avg_latency_ms: number | null;
+    in_progress: number;
+    routes: { route: string; requests: number; errors: number; avg_ms: number | null }[];
+  };
+  workflows: {
+    plans: { target: string; status: string; count: number }[];
+    executions_started: number;
+    executions_in_progress: number;
+    executions_finished: { status: string; count: number }[];
+    rejections: { reason: string; count: number }[];
+    step_retries: number;
+    compensations: { outcome: string; count: number }[];
+  };
+  integrations: {
+    step_failures: { integration: string; action: string; error_code: string; count: number }[];
+    steps: { integration: string; status: string; count: number }[];
+    calls: { integration: string; outcome: string; count: number }[];
+  };
+  ai: {
+    providers: {
+      provider: string;
+      model: string;
+      requests: number;
+      errors: number;
+      avg_latency_ms: number | null;
+      tokens: Record<string, number>;
+    }[];
+    fallbacks: { from_provider: string; to_provider: string; reason: string; count: number }[];
+  };
+}
+
+export interface MonitoringLogRecord {
+  timestamp: string;
+  severity: "DEBUG" | "INFO" | "WARNING" | "ERROR" | "CRITICAL";
+  message: string;
+  logger?: string;
+  event?: string;
+  request_id?: string;
+  workflow_id?: string;
+  trace_id?: string;
+  integration?: string;
+  action?: string;
+  duration_ms?: number;
+  error_code?: string;
+  status?: string;
+}
+
+export interface MonitoringLogs {
+  scope: string;
+  records: MonitoringLogRecord[];
+  loki_explore_url: string | null;
+}
+
+export interface MonitoringRun {
+  kind: "planning" | "execution";
+  workflow_id?: string;
+  trace_id?: string;
+  trace_url?: string | null;
+  started_at?: string;
+  duration_ms?: number;
+  status?: string;
+  error_code?: string;
+  target?: string;
+  mode?: string;
+  provider?: string;
+  fallback_used?: boolean;
+  replayed?: boolean;
+}
+
+export interface MonitoringTraces {
+  scope: string;
+  tracing_enabled: boolean;
+  langfuse_enabled: boolean;
+  langfuse_url: string | null;
+  runs: MonitoringRun[];
+}

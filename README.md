@@ -52,6 +52,10 @@ Open http://127.0.0.1:5173, pick a template, click **Generate Plan**, review it,
 | Method | Path | Phase | Description |
 |---|---|---|---|
 | GET | `/health` | 1 | Liveness check |
+| GET | `/metrics` | 8 | Prometheus metrics (optional bearer token: `METRICS_AUTH_TOKEN`) |
+| GET | `/api/v1/monitoring/summary` | 8 | Monitoring configuration, service reachability and real counters of this API process |
+| GET | `/api/v1/monitoring/logs` | 8 | Latest sanitised structured log records |
+| GET | `/api/v1/monitoring/traces` | 8 | Latest planning/execution runs with trace ids |
 | GET | `/api/v1/workflows/templates` | 1 | Meeting-to-Tasks, Sprint Planning, Incident Response |
 | POST | `/api/v1/workflows` | 1 | Validates input, returns a UUID and status `PLANNED` |
 | POST | `/api/v1/workflows/plan` | 2 | Runs the LangGraph planner; returns a validated plan |
@@ -480,6 +484,157 @@ Latency is recorded on every observation (span timing plus `latency_ms` metadata
 **Failure isolation**: every SDK call is wrapped. If Langfuse is disabled, misconfigured, unreachable, or the SDK raises, the workflow result is identical, and the failure is logged once by exception type. Export happens on the SDK's background thread. Tests pin telemetry to a no-op, so a developer `.env` with `LANGFUSE_ENABLED=true` never makes tests send data.
 
 > Note: `langsmith` is installed as a transitive dependency of LangGraph. Do not set `LANGSMITH_TRACING=true`: LangSmith tracing would capture full graph state, including instruction text.
+
+## Monitoring and observability (Phase 8)
+
+WorkflowWeaver emits **structured logs**, **Prometheus metrics** and **OpenTelemetry traces**, and the existing **Langfuse** tracing keeps working unchanged. A local Docker Compose stack (Prometheus, Grafana, Loki, Tempo and an OpenTelemetry Collector) collects and visualises everything. The UI's **Monitoring & Observability** section shows the same data.
+
+```text
+API (127.0.0.1:8000) -- GET /metrics -----------------------------> Prometheus :9090 --+
+API -- OTLP/HTTP traces --> OTel Collector :4318 --> Tempo :3200 ----------------------+--> Grafana :3000
+API -- LOG_FILE (JSON lines in ./logs) --> Collector (filelog) --> Loki :3100 ---------+
+API -- Langfuse SDK (unchanged) -----------------------------------> Langfuse
+```
+
+How it is wired:
+- **One instrumentation point.** Planning and execution code already reports through `get_telemetry()`. That facade is now a composite: it passes every call to Langfuse (or the no-op) unchanged and fans it out to metrics, structured logs, a recent-runs index and, when Langfuse is off, OpenTelemetry spans. Workflow code, approval gates and sandbox rules are untouched. A failing sink never affects a workflow.
+- **One tracer provider.** It is registered before the Langfuse client, so Langfuse attaches to it. Workflow spans are one set of spans:
+  - Langfuse receives only its own spans (its default filter).
+  - Tempo receives the whole tree: request, workflow, outbound HTTP.
+  - No duplicates.
+
+### Start everything (Windows PowerShell)
+
+```powershell
+# 1. One-time: install the new Python packages
+cd C:\Projects\workflowweaver\backend
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+
+# 2. One-time: Grafana admin password (monitoring\.env is git-ignored; Compose refuses to start without it)
+cd C:\Projects\workflowweaver\monitoring
+Copy-Item .env.example .env
+notepad .env          # set GRAFANA_ADMIN_PASSWORD to a strong value
+
+# 3. Start the monitoring stack (Docker Desktop must be running)
+docker compose up -d
+docker compose ps     # every service "running"
+
+# 4. Start the API with JSON logs, a log file for Loki, tracing and the UI links
+cd C:\Projects\workflowweaver\backend
+$env:LOG_FORMAT = "json"
+$env:LOG_FILE = "..\logs\workflowweaver.jsonl"
+$env:OTEL_ENABLED = "true"
+$env:GRAFANA_URL = "http://127.0.0.1:3000"
+$env:PROMETHEUS_URL = "http://127.0.0.1:9090"
+$env:LOKI_URL = "http://127.0.0.1:3100"
+$env:TEMPO_URL = "http://127.0.0.1:3200"
+uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+# 5. Frontend (second terminal), as before
+cd C:\Projects\workflowweaver\frontend
+npm run dev
+```
+
+You can put the same variables in the repository `.env` instead (see the Phase 8 block in `.env.example`). Without the stack, nothing changes: `OTEL_ENABLED` defaults to `false`, `/metrics` still works, and logs stay human-readable in development (`LOG_FORMAT=auto`).
+
+**Compose commands** (run in `monitoring\`):
+
+| Command | Effect |
+|---|---|
+| `docker compose up -d` | Start the stack |
+| `docker compose ps` | Status |
+| `docker compose logs -f otel-collector` | Follow one service's logs |
+| `docker compose restart grafana` | Restart one service |
+| `docker compose down` | Stop (data volumes kept) |
+| `docker compose down -v` | Stop and delete all stored metrics, logs and traces |
+
+### URLs
+
+| What | URL | Notes |
+|---|---|---|
+| WorkflowWeaver UI, Monitoring & Observability | http://127.0.0.1:5173/#/monitoring | Overview, Logs, Workflow Traces, AI Monitoring |
+| Grafana | http://127.0.0.1:3000 | Sign in with `GRAFANA_ADMIN_USER` / `GRAFANA_ADMIN_PASSWORD` |
+| Dashboard: API performance | http://127.0.0.1:3000/d/ww-api | Requests, 5xx ratio, latency percentiles, error logs |
+| Dashboard: Workflow execution | http://127.0.0.1:3000/d/ww-workflows | Plans, executions, rejections, retries, compensation, LLM calls, fallbacks, tokens |
+| Dashboard: Integration health | http://127.0.0.1:3000/d/ww-integrations | Step success, failures by error code, Drive/Teams call latency |
+| Prometheus targets / alerts | http://127.0.0.1:9090/targets and http://127.0.0.1:9090/alerts | |
+| API metrics | http://127.0.0.1:8000/metrics | Prometheus text format |
+| Monitoring API | http://127.0.0.1:8000/api/v1/monitoring/summary | Also `/logs` and `/traces` |
+
+Every port is published on **127.0.0.1 only**. Grafana has anonymous access and sign-up disabled. The datasources are provisioned read-only, with links from Loki logs to Tempo traces and back via `trace_id`.
+
+### Configuration
+
+| Setting | Default | Purpose |
+|---|---|---|
+| `LOG_FORMAT` | `auto` | `json`, `console`, or `auto` (console in development) |
+| `LOG_FILE` | empty | JSON log file (rotated at 10 MB x 5) that the collector ships to Loki |
+| `SERVICE_NAME` | `workflowweaver-api` | `service` field in logs, `service.name` in traces |
+| `METRICS_ENABLED` / `METRICS_AUTH_TOKEN` | `true` / empty | `/metrics`, with an optional bearer token |
+| `OTEL_ENABLED` / `OTEL_EXPORTER_OTLP_ENDPOINT` / `OTEL_SAMPLE_RATIO` | `false` / `http://127.0.0.1:4318` / `1.0` | Tracing |
+| `GRAFANA_URL`, `LANGFUSE_UI_URL` | empty | Links in the UI |
+| `PROMETHEUS_URL`, `LOKI_URL`, `TEMPO_URL` | empty | Server-side reachability checks shown in the UI |
+
+### Structured logs
+
+- **JSON fields:** every record has `timestamp`, `severity`, `service`, `environment`, `logger`, `message`, `request_id`, `workflow_id`, `trace_id` and `span_id`. Where they apply, it also has `event`, `integration`, `action`, `step_number`, `duration_ms`, `error_code`, `status`, `mode`, `provider`, `model` and `http_status`, plus a sanitised `attributes` object.
+- **Request IDs:** each request gets an `X-Request-ID`. A valid incoming value is kept; otherwise one is generated. It is returned in the response header.
+- **Lifecycle events logged:** `planning.started` / `planning.finished`, `planning.provider_attempt`, `planning.fallback`, `llm.request`, `execution.started` / `execution.finished` / `execution.outcome`, `approval.rejected`, `step.succeeded` / `step.failed`, `execution.retry_scheduled`, `compensation.succeeded` / `compensation.failed` and `integration.call`. There is also one `http.request` access record per request, with the route template, status and duration.
+- **Never logged:** API keys, OAuth tokens, webhook URLs, authorization headers, request bodies, prompts or document content. Redaction is layered:
+  1. The existing filter removes registered integration secrets and URL tokens (`access_token=`, `sig=`, Google OAuth shapes).
+  2. The formatter scrubs every rendered line again (Groq, Anthropic, Google, Langfuse and Notion keys, bearer tokens, JWTs, webhook URLs).
+  3. Credential-named fields are replaced and content fields are reduced to their length.
+  4. Exceptions are logged by type only.
+
+### Metrics (`GET /metrics`)
+
+| Area | Metrics |
+|---|---|
+| HTTP | `ww_http_requests_total{method,route,status}`, `ww_http_request_errors_total`, `ww_http_request_duration_seconds`, `ww_http_requests_in_progress` |
+| Workflows | `ww_workflow_plans_total{target,status}`, `ww_workflow_planning_duration_seconds`, `ww_workflow_executions_started_total{mode,target}`, `ww_workflow_executions_finished_total{mode,target,status}`, `ww_workflow_executions_in_progress`, `ww_workflow_execution_duration_seconds`, `ww_workflow_rejections_total{reason}` |
+| Steps and integrations | `ww_step_duration_seconds{integration,action,status}`, `ww_step_retries_total`, `ww_integration_failures_total{integration,action,error_code}`, `ww_integration_requests_total` and `ww_integration_request_duration_seconds` (Drive REST, Teams), `ww_compensations_total{outcome}` |
+| LLM | `ww_llm_requests_total{provider,model,outcome}`, `ww_llm_request_duration_seconds`, `ww_llm_errors_total{provider,error_code}`, `ww_llm_fallbacks_total{from_provider,to_provider,reason}`, `ww_llm_tokens_total{provider,model,type}` (only when the provider reports usage) |
+
+Labels are always bounded: route templates (never raw URLs), enums, configured model ids and normalised error codes. Workflow, user and file ids are never labels.
+
+### Traces
+
+With `OTEL_ENABLED=true`:
+- **What is traced:**
+  - FastAPI server spans (`/metrics` and `/health` excluded);
+  - outbound httpx calls (Groq and Gemini SDKs, Drive REST, Notion MCP, Teams), with W3C `traceparent` propagation;
+  - planning and execution spans: planning request, provider calls, graph nodes, each tool step, compensation.
+- **Sanitising:** every exported span is scrubbed first, both attributes and span events. This covers the SSE `access_token` query parameter, the Teams `sig`, credential-named attributes and secret-shaped values.
+- **Finding a run:** the Workflow Traces tab links each run to its trace in Grafana (Tempo). With Langfuse on, search Langfuse for the workflow id (it is the session id).
+
+### Alerts
+
+`monitoring/prometheus/alerts.yml` defines these sample rules. They appear in Prometheus (Alerts) and in Grafana; no Alertmanager or notification channel is configured.
+
+| Alert | Fires when |
+|---|---|
+| `WorkflowWeaverApiDown` | `/metrics` is not scraped for 2 minutes |
+| `HighApiErrorRate` | 5xx responses are above 5% for 5 minutes |
+| `SlowWorkflowExecutions` | Execution p95 is above 2 minutes |
+| `SlowPlanning` | Planning p95 is above 60 seconds |
+| `IntegrationFailures` | More than 3 failed step attempts per integration in 10 minutes |
+| `CompensationFailures` | Any failed rollback |
+| `LlmFallbackSpike` | More than 5 fallbacks in 15 minutes |
+
+### Troubleshooting
+
+| Symptom | Check |
+|---|---|
+| `docker compose up` says `Set GRAFANA_ADMIN_PASSWORD` | Create `monitoring\.env` from `.env.example` and set the password, or set `$env:GRAFANA_ADMIN_PASSWORD` in the same shell |
+| Prometheus target `workflowweaver-api` is down | Is the API running on port 8000? Open http://127.0.0.1:8000/metrics in a browser. Docker Desktop must reach the host through `host.docker.internal`. If a firewall or VPN blocks it, start uvicorn with `--host 0.0.0.0` only together with `METRICS_AUTH_TOKEN` and the commented `authorization` block in `prometheus.yml`. |
+| `/metrics` returns 401 | `METRICS_AUTH_TOKEN` is set: put the same value in `monitoring\secrets\metrics_token` (git-ignored), mount it and enable `authorization` in `prometheus.yml` |
+| No logs in Grafana (Loki) | `LOG_FILE` must be set and point into the repository `logs\` folder. The collector reads `*.jsonl` there and starts at the end of the file, so generate new activity. Run `docker compose logs otel-collector`. |
+| No traces in Tempo, or "Not exported" in the UI | `OTEL_ENABLED=true` and the collector running on 127.0.0.1:4318; restart the API after changing it. `OTEL_SAMPLE_RATIO` below 1 drops some traces. |
+| Monitoring tab says "Not configured" | Set `GRAFANA_URL`, `PROMETHEUS_URL`, `LOKI_URL` and `TEMPO_URL` for the API and restart it |
+| Monitoring tab says "Unreachable" | The URL is set but the service is down: `docker compose ps` |
+| UI counters reset | They are counters of the running API process. Prometheus keeps the history; use the Grafana dashboards. |
+| Port already in use (3000, 9090, 3100, 3200, 4317, 4318) | Stop the other program, or change the left side of the `ports:` mapping in `docker-compose.yml` |
 
 ## Real integrations (Phase 5.1 foundation, Phase 5.2 verification)
 

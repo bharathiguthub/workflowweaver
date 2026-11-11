@@ -19,3 +19,10 @@ langfuse==5.1.0
 
 # Phase 5.2 - contract tests validate built arguments against captured MCP schemas
 jsonschema==4.23.0
+
+# Phase 8 - monitoring and observability
+prometheus-client==0.22.1
+# OpenTelemetry API/SDK/OTLP exporter 1.45.2 come with langfuse; contrib instrumentation matches 0.66b2
+opentelemetry-instrumentation-fastapi==0.66b2
+opentelemetry-instrumentation-httpx==0.66b2
+pyyaml==6.0.3  # tests only: validates the committed monitoring configuration

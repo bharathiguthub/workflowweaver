@@ -313,11 +313,25 @@ def get_telemetry() -> Telemetry:
                 from app.core.config import get_settings
 
                 try:
-                    _telemetry = create_telemetry(get_settings())
+                    base = create_telemetry(get_settings())
                 except Exception as exc:  # e.g. invalid settings: never break the app for telemetry
                     logger.warning("telemetry setup failed error=%s; telemetry disabled", type(exc).__name__)
-                    _telemetry = NoopTelemetry()
+                    base = NoopTelemetry()
+                _telemetry = _with_sinks(base)
     return _telemetry
+
+
+def _with_sinks(base: "Telemetry") -> "Telemetry":
+    """Phase 8: wrap the base (Langfuse or no-op) with metrics, structured logs, the recent
+    workflow index and - when OpenTelemetry tracing is on and Langfuse is off - workflow spans."""
+    try:
+        from app.observability.composite import CompositeTelemetry, default_sinks
+        from app.observability.tracing import span_sink
+
+        return CompositeTelemetry(base, default_sinks(), span_sink=span_sink())
+    except Exception as exc:  # observability extras must never disable the base telemetry
+        logger.warning("telemetry sinks unavailable error=%s", type(exc).__name__)
+        return base
 
 
 def set_telemetry(telemetry: Telemetry | None) -> None:

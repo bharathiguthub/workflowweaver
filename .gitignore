@@ -40,3 +40,7 @@ Thumbs.db
 
 # Docs tooling (throwaway venv for docs/diagrams/render_architecture.py)
 .docvenv/
+
+# Local JSON log files (LOG_FILE) and monitoring-stack secrets
+logs/
+monitoring/secrets/

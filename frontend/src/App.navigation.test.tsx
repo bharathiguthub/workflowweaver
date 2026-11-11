@@ -46,7 +46,7 @@ describe("business-capability navigation", () => {
     const nav = screen.getByRole("navigation", { name: "Main" });
     expect(within(nav).getAllByRole("link").map((a) => a.textContent)).toEqual([
       "Dashboard", "Document Management", "Project Management", "Team Communication", "Business Workflows",
-      "AI Workflow Builder", "Execution History", "Integrations & Settings",
+      "AI Workflow Builder", "Execution History", "Monitoring & Observability", "Integrations & Settings",
     ]);
     expect(navLink("Dashboard")).toHaveAttribute("aria-current", "page");
     expect(screen.getByRole("heading", { level: 2, name: "Dashboard" })).toBeInTheDocument();

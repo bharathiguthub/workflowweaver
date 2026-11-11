@@ -69,6 +69,31 @@ class Settings(BaseSettings):
     app_env: str = "development"
     log_level: str = "INFO"
 
+    # ---------- Phase 8: monitoring and observability ----------
+    service_name: str = "workflowweaver-api"
+    # json: one JSON object per line (Loki / production). console: human-readable (local dev).
+    # auto: console when APP_ENV=development, json otherwise.
+    log_format: str = Field(default="auto", pattern="^(auto|json|console)$")
+    # Optional JSON log file (always JSON, rotated at 10 MB x 5) for the local monitoring stack:
+    # the OpenTelemetry Collector tails it and ships it to Loki. Empty = no file.
+    log_file: str | None = None
+    # Prometheus exposition at GET /metrics. Optional bearer token (Prometheus sends it from a
+    # credentials file); empty = no token (the API listens on 127.0.0.1 by default).
+    metrics_enabled: bool = True
+    metrics_auth_token: SecretStr | None = None
+    # OpenTelemetry tracing (FastAPI + outbound httpx + workflow spans) exported over OTLP/HTTP to
+    # the local collector. Off by default: no exporter, no network.
+    otel_enabled: bool = False
+    otel_exporter_otlp_endpoint: str = "http://127.0.0.1:4318"
+    otel_sample_ratio: float = Field(default=1.0, ge=0.0, le=1.0)
+    # Links shown by the UI's Monitoring section (no credentials). Empty = not configured.
+    grafana_url: str | None = None
+    langfuse_ui_url: str | None = None
+    # Server-side reachability probes of the local stack (loopback/https only; never shown raw).
+    prometheus_url: str | None = None
+    loki_url: str | None = None
+    tempo_url: str | None = None
+
     planner_mode: PlannerMode = PlannerMode.MOCK
     # Read from the shell environment OR .env and passed to the Anthropic client explicitly
     # (pydantic-settings does not export .env values to os.environ). Never logged.

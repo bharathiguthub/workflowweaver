@@ -9,6 +9,7 @@ export type SectionId =
   | "business"
   | "builder"
   | "history"
+  | "monitoring"
   | "settings";
 
 export interface Section {
@@ -24,7 +25,7 @@ export interface Section {
 
 export type IconName =
   | "home" | "document" | "project" | "chat" | "flow" | "sparkles" | "clock" | "settings"
-  | "menu" | "close" | "arrow-right" | "refresh";
+  | "menu" | "close" | "arrow-right" | "refresh" | "pulse" | "external";
 
 export const SECTIONS: readonly Section[] = [
   { id: "dashboard", label: "Dashboard", group: "overview", icon: "home", target: null,
@@ -41,6 +42,8 @@ export const SECTIONS: readonly Section[] = [
     description: "Describe a workflow in plain language; the AI plans it with the supported integrations only." },
   { id: "history", label: "Execution History", group: "operations", icon: "clock", target: null,
     description: "Runs started from this browser tab." },
+  { id: "monitoring", label: "Monitoring & Observability", group: "operations", icon: "pulse", target: null,
+    description: "Logs, metrics, workflow traces and AI planner health from the configured monitoring sources." },
   { id: "settings", label: "Integrations & Settings", group: "operations", icon: "settings", target: null,
     description: "Connection status, read-only checks and planner configuration." },
 ];

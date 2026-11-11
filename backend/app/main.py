@@ -12,6 +12,7 @@ from app.api.drive_sandbox import router as drive_sandbox_router
 from app.api.execution import router as execution_router
 from app.api.execution import shutdown_execution_service
 from app.api.integrations import router as integrations_router
+from app.api.monitoring import router as monitoring_router
 from app.api.planning import router as planning_router
 from app.api.project import router as project_router
 from app.api.orchestration import router as orchestration_router
@@ -20,19 +21,16 @@ from app.api.streaming import router as streaming_router
 from app.api.streaming import shutdown_runner
 from app.api.workflows import router as workflows_router
 from app.core.config import cors_origins, get_settings
-from app.core.log_redaction import install_secret_redaction, install_token_redaction
 from app.observability import shutdown_telemetry
+from app.observability.logging_setup import configure_logging
+from app.observability.middleware import RequestContextMiddleware
+from app.observability.tracing import setup_tracing, shutdown_tracing
 
-logging.basicConfig(
-    level=get_settings().log_level.upper(),
-    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
-)
-
-
-# SSE stream tokens travel in query strings; keep them out of access/request logs.
-install_token_redaction()
-# Configured integration secrets (webhook URLs, tokens) are scrubbed from every log record.
-install_secret_redaction()
+# Phase 8.1: structured logging (JSON or human-readable console, LOG_FORMAT). It also installs the
+# redaction filters: SSE stream tokens in URLs and configured integration secrets are scrubbed
+# from every record, and each rendered line is scrubbed again for secret-looking values.
+configure_logging(get_settings())
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
@@ -43,6 +41,7 @@ async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     # Flush buffered Langfuse observations on shutdown. Telemetry itself is created lazily
     # on first use, and a failure here never affects request handling.
     shutdown_telemetry()
+    shutdown_tracing()  # flush buffered OpenTelemetry spans (no-op when tracing is off)
 
 
 app = FastAPI(
@@ -74,6 +73,13 @@ app.include_router(orchestration_router)
 app.include_router(execution_router)
 app.include_router(streaming_router)
 app.include_router(integrations_router)
+app.include_router(monitoring_router)
+
+# Phase 8: outermost middleware - request id, HTTP metrics and the structured access record.
+app.add_middleware(RequestContextMiddleware)
+# Phase 8.4: OpenTelemetry (FastAPI + httpx + workflow spans) when OTEL_ENABLED=true; registered
+# before the lazily created Langfuse client so both share one tracer provider.
+setup_tracing(app, get_settings())
 
 
 @app.get("/health", tags=["health"])

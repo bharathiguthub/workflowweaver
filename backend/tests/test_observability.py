@@ -471,7 +471,8 @@ def test_get_telemetry_is_lazy_and_resettable(monkeypatch):
     monkeypatch.setattr(config, "get_settings", lambda: Settings(_env_file=None))
     set_telemetry(None)
     first = get_telemetry()
-    assert isinstance(first, NoopTelemetry) and get_telemetry() is first
+    # Phase 8: the process-wide telemetry is the composite (metrics/logs) around the base.
+    assert isinstance(first.base, NoopTelemetry) and get_telemetry() is first
     shutdown_telemetry()
     shutdown_telemetry()  # idempotent
 

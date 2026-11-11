@@ -48,6 +48,7 @@ import { WorkflowInput } from "./components/WorkflowInput";
 import { BUILDER_TARGETS, SECTION_BY_ID, sectionFromHash, sectionHash, type SectionId } from "./navigation";
 import { DashboardPage } from "./pages/DashboardPage";
 import { HistoryPage } from "./pages/HistoryPage";
+import { MonitoringPage } from "./pages/MonitoringPage";
 import { plannerSummary } from "./pages/readiness";
 import { SettingsPage } from "./pages/SettingsPage";
 import { isTerminalStatus } from "./state/execution";
@@ -551,6 +552,8 @@ export default function App({ initialSection = "dashboard" }: { initialSection?:
       }
       case "history":
         return <HistoryPage entries={history} />;
+      case "monitoring":
+        return <MonitoringPage />;
       case "settings":
         return (
           <SettingsPage

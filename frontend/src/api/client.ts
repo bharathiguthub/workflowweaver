@@ -11,6 +11,9 @@ import type {
   ExecutionMode,
   FastApiErrorBody,
   IntegrationsStatus,
+  MonitoringLogs,
+  MonitoringSummary,
+  MonitoringTraces,
   NotionConnectivity,
   OrchestrationInput,
   OrchestrationPlanResponse,
@@ -253,6 +256,28 @@ export async function previewDocument(fileId: string, mode: ExecutionMode): Prom
   );
   if (status !== 200) throw new ApiError(status, detailMessage(body, `Could not preview the document (HTTP ${status}).`), body);
   return body as DocumentPreview;
+}
+
+/** GET /api/v1/monitoring/summary: configuration, service reachability and real counters of this API process. */
+export async function getMonitoringSummary(): Promise<MonitoringSummary> {
+  const { status, body } = await send("/api/v1/monitoring/summary");
+  if (status !== 200) throw new ApiError(status, detailMessage(body, `Monitoring data is unavailable (HTTP ${status}).`), body);
+  return body as MonitoringSummary;
+}
+
+/** GET /api/v1/monitoring/logs: latest sanitised structured log records of this API process. */
+export async function getMonitoringLogs(level?: string): Promise<MonitoringLogs> {
+  const query = level ? `?level=${encodeURIComponent(level)}` : "";
+  const { status, body } = await send(`/api/v1/monitoring/logs${query}`);
+  if (status !== 200) throw new ApiError(status, detailMessage(body, `Logs are unavailable (HTTP ${status}).`), body);
+  return body as MonitoringLogs;
+}
+
+/** GET /api/v1/monitoring/traces: latest planning/execution runs with trace ids. */
+export async function getMonitoringTraces(): Promise<MonitoringTraces> {
+  const { status, body } = await send("/api/v1/monitoring/traces");
+  if (status !== 200) throw new ApiError(status, detailMessage(body, `Workflow traces are unavailable (HTTP ${status}).`), body);
+  return body as MonitoringTraces;
 }
 
 /** GET /api/v1/integrations/status: modes, write switches and destination aliases (no secrets). */

@@ -1,0 +1,75 @@
+# OpenTelemetry Collector: traces from the API -> Tempo; JSON log file -> Loki (OTLP).
+# Defence in depth: the API already sanitises spans and logs; the collector additionally drops
+# credential-named attributes and never adds any.
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+      http:
+        endpoint: 0.0.0.0:4318
+
+  # The API writes one JSON object per line when LOG_FILE is set (../logs on the host).
+  filelog:
+    include: [/var/log/workflowweaver/*.jsonl]
+    start_at: end
+    operators:
+      - type: json_parser
+        timestamp:
+          parse_from: attributes.timestamp
+          layout_type: gotime
+          layout: "2006-01-02T15:04:05.999-07:00"
+        severity:
+          parse_from: attributes.severity
+      - type: trace_parser
+        trace_id:
+          parse_from: attributes.trace_id
+        span_id:
+          parse_from: attributes.span_id
+      - type: move
+        from: attributes.message
+        to: body
+
+processors:
+  batch: {}
+  memory_limiter:
+    check_interval: 5s
+    limit_mib: 256
+  resource/service:
+    attributes:
+      - key: service.name
+        value: workflowweaver-api
+        action: upsert
+  attributes/scrub:
+    actions:
+      - key: http.request.header.authorization
+        action: delete
+      - key: authorization
+        action: delete
+      - key: cookie
+        action: delete
+
+exporters:
+  otlp/tempo:
+    endpoint: tempo:4317
+    tls:
+      insecure: true
+  otlphttp/loki:
+    endpoint: http://loki:3100/otlp
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, attributes/scrub, batch]
+      exporters: [otlp/tempo]
+    logs:
+      receivers: [filelog]
+      processors: [memory_limiter, resource/service, attributes/scrub, batch]
+      exporters: [otlphttp/loki]
